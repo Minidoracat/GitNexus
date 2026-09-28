@@ -34,6 +34,27 @@ function writeFixtureRepo(root: string, files: Record<string, string>): void {
   }
 }
 
+/** Index `files` in a throwaway repo and hand the pipeline result to `check`. */
+async function withLuaFixture(
+  files: Record<string, string>,
+  check: (result: PipelineResult) => void,
+): Promise<void> {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-scope-fixture-'));
+  try {
+    writeFixtureRepo(tmpDir, files);
+    check(await runPipelineFromRepo(tmpDir, () => {}));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+/** CALLS edges as `caller -> callee@file`, for readable failure output. */
+function callsBetween(result: PipelineResult, source: string, target: string): string[] {
+  return getRelationships(result, 'CALLS')
+    .filter((edge) => edge.source === source && edge.target === target)
+    .map((edge) => `${edge.source} -> ${edge.target}@${path.basename(edge.targetFilePath)}`);
+}
+
 describe('Lua scope resolver binding merge', () => {
   it('retains imported bindings when layering them onto existing bindings', () => {
     const local = {
@@ -60,6 +81,31 @@ describe('Lua scope resolver binding merge', () => {
       imported,
     ]);
     expect(luaScopeResolver.language).toBe(SupportedLanguages.Lua);
+  });
+
+  it('keeps table members out of the bare-name bucket', () => {
+    const member = {
+      def: {
+        nodeId: 'member',
+        filePath: 'picker.lua',
+        type: 'Method',
+        qualifiedName: 'Picker.getText',
+      },
+      origin: 'local',
+    } satisfies BindingRef;
+    const global = {
+      def: {
+        nodeId: 'global',
+        filePath: 'picker.lua',
+        type: 'Function',
+        qualifiedName: 'getText',
+      },
+      origin: 'local',
+    } satisfies BindingRef;
+
+    expect(luaScopeResolver.mergeBindings([], [member, global], 'scope:picker' as ScopeId)).toEqual(
+      [global],
+    );
   });
 });
 
@@ -238,17 +284,19 @@ end
           match['@declaration.name']?.text === 'alias',
       ),
     ).toBe(true);
+    // The closure's def sits on its own function value (the node that is also
+    // its `@scope.function`), so calls inside it are attributed to `callback`.
     expect(
       captures.some(
         (match) =>
-          match['@declaration.function']?.text === 'local value, callback = 1, function() end' &&
+          match['@declaration.function']?.text === 'function() end' &&
           match['@declaration.name']?.text === 'callback',
       ),
     ).toBe(true);
     expect(
       captures.some(
         (match) =>
-          match['@declaration.function']?.text === 'local value, callback = 1, function() end' &&
+          match['@declaration.function'] !== undefined &&
           match['@declaration.name']?.text === 'value',
       ),
     ).toBe(false);
@@ -981,4 +1029,151 @@ return x
     emitLuaScopeCaptures(noHeritageSrc, 'lifecycle.lua');
     expect(collectLuaCaptureSideChannel('lifecycle.lua')).toBeUndefined();
   });
+
+  it('drops a stale local-only callee fact when the local disappears', () => {
+    emitLuaScopeCaptures('local function f() end\nf()\n', 'lifecycle.lua');
+    expect(collectLuaCaptureSideChannel('lifecycle.lua')?.localOnlyCallees).toEqual(['f']);
+    emitLuaScopeCaptures(noHeritageSrc, 'lifecycle.lua');
+    expect(collectLuaCaptureSideChannel('lifecycle.lua')).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Lua visibility: a bare name reaches the innermost `local`, else a global.
+// Table members (`T.f`, `T:f`) and `local` functions are never reachable by a
+// bare name from another scope/file. Regressions from the PZ corpus.
+// ---------------------------------------------------------------------------
+
+describe('Lua scope: bare-name visibility (no false edges)', () => {
+  it('never binds a bare engine-global call to a same-named table method', async () => {
+    await withLuaFixture(
+      {
+        'm/media/lua/client/mod/picker.lua': `local P = {}
+local Picker = {}
+Picker.__index = Picker
+local function tr(key) return getText("UI_" .. key) end
+function Picker:getText() return self.ac:getText() end
+function P.new() return setmetatable({}, Picker) end
+return P
+`,
+        'm/media/lua/client/mod/panel.lua': `require "mod/picker"
+function render() return getText("UI_Title") end
+`,
+      },
+      (result) => {
+        expect(getNodesByLabel(result, 'Method')).toContain('getText');
+        expect(
+          getRelationships(result, 'CALLS')
+            .filter((edge) => edge.target === 'getText')
+            .map((edge) => `${edge.source} -> getText`),
+        ).toEqual([]);
+      },
+    );
+  }, 60000);
+
+  it('does not route a local alias call to a same-named member of another table', async () => {
+    await withLuaFixture(
+      {
+        'm/media/lua/shared/core.lua': `MyMod = MyMod or {}
+MyMod.Client = MyMod.Client or {}
+local C = MyMod.Client
+function C.itemLabel(t) return t end
+`,
+        'm/media/lua/client/widgets.lua': `local U = {}
+MyMod.Client.UI = U
+function U.itemName(t) return t end
+return U
+`,
+        'm/media/lua/client/panel.lua': `local C = MyMod.Client
+local itemName = C.itemLabel
+function draw(e) return itemName(e) end
+`,
+      },
+      (result) => {
+        expect(callsBetween(result, 'draw', 'itemName')).toEqual([]);
+      },
+    );
+  }, 60000);
+
+  it("keeps a file's own local function callable but invisible to other files", async () => {
+    await withLuaFixture(
+      {
+        'm/media/lua/shared/dyn.lua': `MDADDynamics = MDADDynamics or {}
+local D = MDADDynamics
+function D.finite(n) return n == n end
+`,
+        'm/media/lua/shared/profile.lua': `local function isFinite(n) return n == n end
+function profileOk(x) return isFinite(x) end
+`,
+        'm/media/lua/shared/follower.lua': `local isFinite = MDADDynamics.finite
+function laneOk(x) return isFinite(x) end
+`,
+      },
+      (result) => {
+        expect(callsBetween(result, 'profileOk', 'isFinite')).toEqual([
+          'profileOk -> isFinite@profile.lua',
+        ]);
+        expect(callsBetween(result, 'laneOk', 'isFinite')).toEqual([]);
+      },
+    );
+  }, 60000);
+
+  it('binds a forward-declared local to its later assignment, not to another file', async () => {
+    await withLuaFixture(
+      {
+        'm/media/lua/client/mm.lua': `local getBoolOption
+local function refresh() return getBoolOption("A", true) end
+getBoolOption = function(id, d) return d end
+`,
+        'm/media/lua/client/poi.lua': `local function getBoolOption(id, d) return d end
+function poiRefresh() return getBoolOption("B", false) end
+`,
+      },
+      (result) => {
+        expect(callsBetween(result, 'refresh', 'getBoolOption')).toEqual([
+          'refresh -> getBoolOption@mm.lua',
+        ]);
+        expect(callsBetween(result, 'poiRefresh', 'getBoolOption')).toEqual([
+          'poiRefresh -> getBoolOption@poi.lua',
+        ]);
+      },
+    );
+  }, 60000);
+
+  it("lets a unique true global win over another file's local of the same name", async () => {
+    await withLuaFixture(
+      {
+        'a.lua': 'local function helper() end\n',
+        'b.lua': 'function helper() end\n',
+        'c.lua': 'function run() helper() end\n',
+      },
+      (result) => {
+        expect(callsBetween(result, 'run', 'helper')).toEqual(['run -> helper@b.lua']);
+      },
+    );
+  }, 60000);
+
+  it("never reaches another file's local function when no global exists", async () => {
+    await withLuaFixture(
+      {
+        'a.lua': 'local function helper() end\n',
+        'c.lua': 'function run() helper() end\n',
+      },
+      (result) => {
+        expect(callsBetween(result, 'run', 'helper')).toEqual([]);
+      },
+    );
+  }, 60000);
+
+  it('does not guess a global for a call through a parameter of the same name', async () => {
+    await withLuaFixture(
+      {
+        'lib.lua': 'function cb() end\n',
+        'main.lua': 'function use(cb) cb() end\n',
+      },
+      (result) => {
+        expect(callsBetween(result, 'use', 'cb')).toEqual([]);
+      },
+    );
+  }, 60000);
 });

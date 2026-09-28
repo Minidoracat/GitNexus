@@ -2632,6 +2632,24 @@ export const LUA_QUERIES = `
 (local_function_definition_statement
   name: (identifier) @name) @definition.function
 
+; ── Function values bound by assignment ────────────────────────────────────────
+;   local f = function … end / f = function … end / T.f = function … end.
+;   The definition is captured on the function_definition VALUE node — the node
+;   the scope captures anchor the same declaration on — and each pattern admits
+;   exactly one target and one value, so a multi-assignment cannot cross-pair a
+;   name with another position's function.
+(local_variable_declaration
+  (variable_list . (variable name: (identifier) @name) .)
+  (expression_list . value: (function_definition) @definition.function .))
+
+(variable_assignment
+  (variable_list . (variable name: (identifier) @name) .)
+  (expression_list . value: (function_definition) @definition.function .))
+
+(variable_assignment
+  (variable_list . (variable table: (_) field: (identifier) @name) .)
+  (expression_list . value: (function_definition) @definition.method .))
+
 ; ── middleclass classes: local Foo = class("Foo"[, Parent]) ─────────────────────
 ;   class() is a plain call; the Class node's name comes from the local var
 ;   (quote-free). EXTENDS (Parent arg) + HAS_METHOD (function Foo:method() → Foo)

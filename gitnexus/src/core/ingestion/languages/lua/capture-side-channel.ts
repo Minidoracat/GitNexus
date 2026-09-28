@@ -46,6 +46,12 @@ export interface LuaCaptureSideChannel {
   readonly returnedFields: readonly LuaReturnedField[];
   /** Module-level static callable aliases, e.g. `local f = util.answer`. */
   readonly callableAliases: readonly LuaCallableAlias[];
+  /**
+   * Names whose every bare call in this file resolves to a lexical `local`
+   * (see `path-env.ts`). A workspace-wide name guess for such a call is
+   * impossible — the local shadows any global — so the resolver refuses it.
+   */
+  readonly localOnlyCallees: readonly string[];
 }
 
 const _facts = new Map<string, LuaCaptureSideChannel>();

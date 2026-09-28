@@ -58,7 +58,8 @@ function populateLuaOwners(parsed: ParsedFile): void {
       const method = parsed.localDefs.find(
         (def) =>
           def.type === 'Method' &&
-          def.qualifiedName === pair.method &&
+          // Table members carry the written owner path (`Dog.bark`).
+          def.qualifiedName === `${pair.owner}.${pair.method}` &&
           // `parsed.localDefs` carries scope definition IDs with the
           // 1-based capture line, while the side-channel row is tree-sitter's
           // 0-based row. Parse the definition ID instead of relying on a
@@ -70,6 +71,19 @@ function populateLuaOwners(parsed: ParsedFile): void {
     }
   }
   populateClassOwnedMembers(parsed);
+}
+
+const localOnlyCalleesByFile = new WeakMap<ParsedFile, ReadonlySet<string>>();
+
+/** `localOnlyCallees` of a file's capture side channel, as a Set (memoized per ParsedFile). */
+function localOnlyCalleesOf(parsed: ParsedFile): ReadonlySet<string> {
+  let names = localOnlyCalleesByFile.get(parsed);
+  if (names === undefined) {
+    const channel = parsed.captureSideChannel as LuaCaptureSideChannel | undefined;
+    names = new Set(channel?.kind === 'lua' ? channel.localOnlyCallees : []);
+    localOnlyCalleesByFile.set(parsed, names);
+  }
+  return names;
 }
 
 function resolveLuaBaseMember(
@@ -273,8 +287,17 @@ const luaScopeResolver: ScopeResolver = {
     return suffixResolve(parts, [], [], _cachedIndex ?? undefined, LUA_EXTENSIONS);
   },
 
-  // Lua: default local-first-then-imports merge (no language-specific precedence).
-  mergeBindings: (existing, incoming) => [...existing, ...incoming],
+  // Local-first-then-imports merge, minus table members: `function T.f` is
+  // reached as `T.f`, never as a bare `f`, so it must not enter the finalize
+  // bucket that bare-name lookups consult (its lexical binding is already the
+  // unspellable dotted name — see `markLuaTableMember` in captures.ts).
+  mergeBindings: (existing, incoming) => [
+    ...existing,
+    ...incoming.filter(
+      ({ def }) =>
+        !((def.type === 'Method' || def.type === 'Function') && def.qualifiedName?.includes('.')),
+    ),
+  ],
 
   // Lua supplies nil for missing positional arguments and ignores extras, so
   // TypeScript-style min/max arity filtering would reject valid calls.
@@ -302,8 +325,14 @@ const luaScopeResolver: ScopeResolver = {
   emitHeritageEdges: emitLuaHeritageEdges,
 
   // Lua has globals (`function foo()` is global) — let unresolved free calls
-  // fall back to the global symbol table.
+  // fall back to the global symbol table. Only true globals are candidates:
+  // `local function` and table members are file-private by bare name
+  // (`@declaration.is-exported: false`), and a bare call whose name is a
+  // lexical local cannot reach a global at all.
   allowGlobalFreeCallFallback: true,
+  isFileLocalDef: (def) => def.isExported === false,
+  isGlobalNameFallbackPlausible: ({ callerParsed, candidate, site }) =>
+    candidate.isExported !== false && !localOnlyCalleesOf(callerParsed).has(site.name),
 
   // Module-level aliases such as `local f = util.answer; f()` are not
   // receiver calls, so the generic receiver pass cannot see their target.

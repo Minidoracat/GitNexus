@@ -30,6 +30,12 @@ const LUA_SCOPE_QUERY = `
 
 (function_definition_statement) @scope.function
 (local_function_definition_statement) @scope.function
+;; Anonymous / value functions ('local f = function', 'T.f = function',
+;; 'Events.OnTick.Add(function() ... end)') are real scopes too: their locals
+;; and parameters must not leak, and calls inside them are attributed to the
+;; closure's own def (anchored on this same node by captures.ts) or, for an
+;; unnamed callback, to the enclosing file rather than to a sibling closure.
+(function_definition) @scope.function
 
 ;; ── Declarations — functions ─────────────────────────────────────────────────
 (function_definition_statement
