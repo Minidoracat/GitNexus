@@ -771,9 +771,13 @@ import { copyV8CacheIfPresent, tryLoadV8Cache, writeV8CacheFile } from './v8-sid
 // drops `callableAliases` for `defKeys` / `classKeys` / `localOnlyCallees` /
 // return keys. A warm v99 cache replays unchanged `.lua` files with none of
 // these facts, so every Lua fix would be inert until a source edit.
+// v101 (same fork): the Java capture side channel gains `jvmNameFacts` —
+// internal-name string literals (`"pkg/Outer$Inner"`) and the argument lists
+// pairing them with method-name literals. A warm v100 cache replays `.java`
+// files without the field, so no JVM-name edge would appear until a source edit.
 // NOTE for a rebase onto upstream main: upstream already used 100–117 at the
-// same package version, so re-pick the next value above upstream's then.
-const SCHEMA_BUMP = 100;
+// same package version, so re-pick the next values above upstream's then.
+const SCHEMA_BUMP = 101;
 const GITNEXUS_PKG_VERSION = (() => {
   try {
     // package.json sits at gitnexus/package.json — two levels up from

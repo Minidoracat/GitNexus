@@ -4,6 +4,10 @@ All notable changes to GitNexus will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Java: JVM internal-name strings link to in-repo classes and methods** — a string literal such as `"com/acme/hooks/Watchdog$Probe"` (ASM transformers, bytecode agents) now resolves to the class whose declared package and member-class nesting match exactly and uniquely, emitting `USES` from the enclosing method (or class, for field initializers) so `impact()` sees it by default. When the same argument list also carries a method-name literal — with the class given inline, by a same-file `static final String`, or by an effectively-final local — a `CALLS` edge goes to that method; overloads are narrowed by the adjacent descriptor's parameter count and otherwise left at the class edge. Both edges use reason `jvm-internal-name` at confidence 0.7. Names outside the repository, bare packages, path strings and dotted `a.b.C` forms produce nothing. Parse-cache `SCHEMA_BUMP` 100 → 101.
+
 ## [1.6.12] - 2026-09-12
 
 ### Added

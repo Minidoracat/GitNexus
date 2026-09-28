@@ -3626,3 +3626,182 @@ describe('Java receiver-unresolved drops name the program boundary (#2744)', () 
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// JVM internal-name strings: bytecode tooling (ASM transformers) names in-repo
+// classes as "pkg/Outer$Inner" and methods by a literal beside it.
+// ---------------------------------------------------------------------------
+
+describe('Java JVM internal-name string references', () => {
+  let repoDir: string;
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-java-jvm-names-'));
+    writeFixtureRepo(repoDir, {
+      'hooks/com/acme/hooks/Watchdog.java': `package com.acme.hooks;
+public final class Watchdog {
+    public static void tick() {}
+    public static void report(int code) {}
+    public static void report(String message) {}
+    public static void report(int code, String message) {}
+    public static final class Probe {
+        public static void sample(long at) {}
+    }
+}
+`,
+      'hooks/com/acme/hooks/Runtime.java': `package com.acme.hooks;
+public final class Runtime {
+    public static void renderEndFrame() {}
+}
+`,
+      'stubs/com/acme/stubs/GameServer.java': `package com.acme.stubs;
+public final class GameServer {
+    public static void update() {}
+}
+`,
+      'patcher/com/acme/patcher/PatchConfig.java': `package com.acme.patcher;
+import com.acme.hooks.Watchdog;
+final class PatchConfig {
+    private static final String RUNTIME = "com/acme/hooks/Runtime";
+    private static final String GAME = "org/game/network/GameServer";
+
+    void wireConstant() { hook(RUNTIME, "renderEndFrame", "()V"); }
+    void wireLocal() {
+        String cls = "com/acme/hooks/Runtime";
+        hook(cls, "renderEndFrame", "()V");
+    }
+    void reassigned(boolean flag) {
+        String cls = "com/acme/hooks/Runtime";
+        if (flag) cls = pick();
+        hook(cls, "renderEndFrame", "()V");
+    }
+    void shadowed(String RUNTIME) { hook(RUNTIME, "renderEndFrame", "()V"); }
+    void wireLiteral() { new HeadCall("com/acme/hooks/Watchdog", "tick"); }
+    boolean verify(Insn call, byte[] out) {
+        return call.owner.equals("com/acme/hooks/Watchdog")
+            && method(patched(out, "com/acme/hooks/Runtime"), "renderEndFrame", "()V");
+    }
+    void wireNested() { hook("com/acme/hooks/Watchdog$Probe", "sample", "(J)V"); }
+    void wireOverload() { hook("com/acme/hooks/Watchdog", "report", "(I)V"); }
+    void wireOverloadArity() { hook("com/acme/hooks/Watchdog", "report", "(ILjava/lang/String;)V"); }
+    void outside() { load("org/game/network/GameServer", "update"); load(GAME); load("com/acme/hooks/Runtime"); }
+    void packageOnly() { load("com/acme/hooks"); load("com/acme/hooks/Runtime"); }
+    void pathStrings() {
+        load("com/acme/hooks/Watchdog.java");
+        load("assets/hooks/Watchdog");
+        load("/com/acme/hooks/Watchdog");
+        load("com/acme/hooks/Runtime");
+    }
+    void dotted() { load("com.acme.hooks.Watchdog", "tick"); load("com/acme/hooks/Runtime"); }
+    void directAndString() {
+        Watchdog.tick();
+        hook("com/acme/hooks/Watchdog", "tick", "()V");
+    }
+
+    static void hook(String owner, String name, String descriptor) {}
+    static void load(String path) {}
+    static void load(String path, String name) {}
+    static boolean method(byte[] cls, String name, String descriptor) { return true; }
+    static byte[] patched(byte[] out, String owner) { return out; }
+    static String pick() { return "x"; }
+}
+
+final class HeadCall {
+    HeadCall(String owner, String name) {}
+}
+
+final class Insn {
+    String owner;
+}
+`,
+    });
+    result = await runPipelineFromRepo(repoDir, () => {}, {});
+  }, 60000);
+
+  afterAll(() => {
+    if (repoDir !== undefined) fs.rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  const jvmTargets = (type: 'USES' | 'CALLS', source: string): string[] =>
+    getRelationships(result, type)
+      .filter((edge) => edge.rel.reason === 'jvm-internal-name' && edge.source === source)
+      .map((edge) => `${edge.targetLabel}:${edge.target}`)
+      .sort();
+
+  it('links a static final String constant from its declaring class and pairs it with a method name', () => {
+    expect(jvmTargets('USES', 'PatchConfig')).toEqual(['Class:Runtime']);
+    expect(jvmTargets('CALLS', 'wireConstant')).toEqual(['Method:renderEndFrame']);
+  });
+
+  it('pairs an effectively-final local holding an internal name with a method name', () => {
+    expect(jvmTargets('USES', 'wireLocal')).toEqual(['Class:Runtime']);
+    expect(jvmTargets('CALLS', 'wireLocal')).toEqual(['Method:renderEndFrame']);
+  });
+
+  it('does not pair a reassigned local or a parameter shadowing a constant', () => {
+    expect(jvmTargets('USES', 'reassigned')).toEqual(['Class:Runtime']);
+    expect(jvmTargets('CALLS', 'reassigned')).toEqual([]);
+    expect(jvmTargets('CALLS', 'shadowed')).toEqual([]);
+  });
+
+  it('links an inline internal name and the method-name literal beside it', () => {
+    expect(jvmTargets('USES', 'wireLiteral')).toEqual(['Class:Watchdog']);
+    expect(jvmTargets('CALLS', 'wireLiteral')).toEqual(['Method:tick']);
+    const edge = getRelationships(result, 'CALLS').find(
+      (candidate) => candidate.source === 'wireLiteral' && candidate.target === 'tick',
+    );
+    expect(edge?.rel.confidence).toBe(0.7);
+  });
+
+  it('links internal names compared in verification code to the checking method, without a method guess', () => {
+    expect(jvmTargets('USES', 'verify')).toEqual(['Class:Runtime', 'Class:Watchdog']);
+    expect(jvmTargets('CALLS', 'verify')).toEqual([]);
+  });
+
+  it('resolves a $-nested internal name to the member class and its method', () => {
+    expect(jvmTargets('USES', 'wireNested')).toEqual(['Class:Probe']);
+    expect(jvmTargets('CALLS', 'wireNested')).toEqual(['Method:sample']);
+  });
+
+  it('links nothing for names outside the repository, even with a same-named class elsewhere', () => {
+    expect(jvmTargets('USES', 'outside')).toEqual(['Class:Runtime']);
+    expect(jvmTargets('CALLS', 'outside')).toEqual([]);
+  });
+
+  it('links nothing for a bare package name', () => {
+    expect(jvmTargets('USES', 'packageOnly')).toEqual(['Class:Runtime']);
+  });
+
+  it('links nothing for path strings that merely end in a class name', () => {
+    expect(jvmTargets('USES', 'pathStrings')).toEqual(['Class:Runtime']);
+  });
+
+  it('leaves dotted class names alone', () => {
+    expect(jvmTargets('USES', 'dotted')).toEqual(['Class:Runtime']);
+    expect(jvmTargets('CALLS', 'dotted')).toEqual([]);
+  });
+
+  it('keeps only the class edge when the descriptor cannot pick one overload', () => {
+    expect(jvmTargets('USES', 'wireOverload')).toEqual(['Class:Watchdog']);
+    expect(jvmTargets('CALLS', 'wireOverload')).toEqual([]);
+  });
+
+  it('picks the overload whose parameter count matches the descriptor', () => {
+    const edges = getRelationships(result, 'CALLS').filter(
+      (edge) => edge.rel.reason === 'jvm-internal-name' && edge.source === 'wireOverloadArity',
+    );
+    expect(
+      edges.map((edge) => [edge.target, result.graph.getNode(edge.rel.targetId)?.properties.parameterCount]),
+    ).toEqual([['report', 2]]);
+  });
+
+  it('keeps the direct call edge when the same method is also named by string', () => {
+    const calls = getRelationships(result, 'CALLS').filter(
+      (edge) => edge.source === 'directAndString' && edge.target === 'tick',
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.rel.reason).not.toBe('jvm-internal-name');
+    expect(jvmTargets('USES', 'directAndString')).toEqual(['Class:Watchdog']);
+  });
+});

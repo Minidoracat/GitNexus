@@ -16,6 +16,7 @@ import type { JavaSpringDiClassFact } from './spring-di.js';
 import type { SpringDynamicLookupFact } from '../../frameworks/spring/dynamic-lookups.js';
 import type { SpringMessageProducerFact } from '../../frameworks/spring/message-producers.js';
 import type { JavaSpringNonHttpHandlerFact } from './spring-non-http-handlers.js';
+import type { JavaJvmNameFacts } from './jvm-internal-names.js';
 
 export type JavaClassAnnotationFact = ClassAnnotationFact;
 
@@ -30,6 +31,7 @@ export interface JavaCaptureSideChannel {
   readonly springDynamicLookupFacts?: readonly SpringDynamicLookupFact[];
   readonly springNonHttpHandlerFacts?: readonly JavaSpringNonHttpHandlerFact[];
   readonly springMessageProducerFacts?: readonly SpringMessageProducerFact[];
+  readonly jvmNameFacts?: JavaJvmNameFacts;
 }
 
 const classAnnotations = createClassAnnotationFactStore();
@@ -40,6 +42,7 @@ const springDiFacts = new Map<string, readonly JavaSpringDiClassFact[]>();
 const springDynamicLookupFacts = new Map<string, readonly SpringDynamicLookupFact[]>();
 const springNonHttpHandlerFacts = new Map<string, readonly JavaSpringNonHttpHandlerFact[]>();
 const springMessageProducerFacts = new Map<string, readonly SpringMessageProducerFact[]>();
+const jvmNameFacts = new Map<string, JavaJvmNameFacts>();
 
 /** Clear facts retained by a prior workspace pass in a long-lived process. */
 export function clearJavaClassAnnotationFacts(): void {
@@ -51,6 +54,7 @@ export function clearJavaClassAnnotationFacts(): void {
   springDynamicLookupFacts.clear();
   springNonHttpHandlerFacts.clear();
   springMessageProducerFacts.clear();
+  jvmNameFacts.clear();
 }
 
 export function setJavaSpringAopFacts(filePath: string, facts: readonly JavaSpringAopFact[]): void {
@@ -152,6 +156,15 @@ export function getJavaSpringMessageProducerFacts(
   return springMessageProducerFacts.get(filePath) ?? [];
 }
 
+export function setJavaJvmNameFacts(filePath: string, facts: JavaJvmNameFacts | undefined): void {
+  if (facts === undefined) jvmNameFacts.delete(filePath);
+  else jvmNameFacts.set(filePath, facts);
+}
+
+export function getJavaJvmNameFacts(filePath: string): JavaJvmNameFacts | undefined {
+  return jvmNameFacts.get(filePath);
+}
+
 /** Snapshot worker-local Java annotation facts for ParsedFile serialization. */
 export function collectJavaCaptureSideChannel(
   filePath: string,
@@ -164,6 +177,7 @@ export function collectJavaCaptureSideChannel(
   const dynamicLookupFacts = springDynamicLookupFacts.get(filePath) ?? [];
   const nonHttpHandlerFacts = springNonHttpHandlerFacts.get(filePath) ?? [];
   const messageProducerFacts = springMessageProducerFacts.get(filePath) ?? [];
+  const nameFacts = jvmNameFacts.get(filePath);
   const packageFact = getJavaPackageFact(filePath);
   if (
     facts.length === 0 &&
@@ -174,6 +188,7 @@ export function collectJavaCaptureSideChannel(
     dynamicLookupFacts.length === 0 &&
     nonHttpHandlerFacts.length === 0 &&
     messageProducerFacts.length === 0 &&
+    nameFacts === undefined &&
     packageFact === undefined
   ) {
     return undefined;
@@ -191,6 +206,7 @@ export function collectJavaCaptureSideChannel(
     ...(messageProducerFacts.length > 0
       ? { springMessageProducerFacts: messageProducerFacts }
       : {}),
+    ...(nameFacts !== undefined ? { jvmNameFacts: nameFacts } : {}),
   };
 }
 
@@ -216,6 +232,7 @@ export function applyJavaCaptureSideChannel(parsed: ParsedFile): void {
     setJavaSpringDynamicLookupFacts(parsed.filePath, []);
     setJavaSpringNonHttpHandlerFacts(parsed.filePath, []);
     setJavaSpringMessageProducerFacts(parsed.filePath, []);
+    setJavaJvmNameFacts(parsed.filePath, undefined);
     setJavaPackageFact(parsed.filePath, UNKNOWN_JVM_PACKAGE_FACT);
     return;
   }
@@ -248,8 +265,16 @@ export function applyJavaCaptureSideChannel(parsed: ParsedFile): void {
     parsed.filePath,
     Array.isArray(data.springMessageProducerFacts) ? data.springMessageProducerFacts : [],
   );
+  setJavaJvmNameFacts(parsed.filePath, isJavaJvmNameFacts(data.jvmNameFacts) ? data.jvmNameFacts : undefined);
   setJavaPackageFact(
     parsed.filePath,
     isJvmPackageFact(data.packageFact) ? data.packageFact : UNKNOWN_JVM_PACKAGE_FACT,
   );
+}
+
+/** Shape gate for facts restored from an opaque (possibly stale) cache payload. */
+function isJavaJvmNameFacts(value: unknown): value is JavaJvmNameFacts {
+  if (value === null || typeof value !== 'object') return false;
+  const facts = value as { refs?: unknown; calls?: unknown };
+  return Array.isArray(facts.refs) && Array.isArray(facts.calls);
 }

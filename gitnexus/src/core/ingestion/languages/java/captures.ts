@@ -42,6 +42,7 @@ import {
   setJavaSpringDynamicLookupFacts,
   setJavaSpringMessageProducerFacts,
   setJavaSpringNonHttpHandlerFacts,
+  setJavaJvmNameFacts,
 } from './capture-side-channel.js';
 import { captureJavaPackageFact } from './package-facts.js';
 import { synthesizeCallableFlowCaptures } from '../../utils/callable-flow-captures.js';
@@ -51,6 +52,7 @@ import type { SpringDynamicLookupFact } from '../../frameworks/spring/dynamic-lo
 import { captureJavaSpringDynamicLookupFact } from './spring-dynamic-lookup.js';
 import type { SpringMessageProducerFact } from '../../frameworks/spring/message-producers.js';
 import { captureJavaSpringMessageProducerFact } from './spring-message-producers.js';
+import { captureJavaJvmNameFacts } from './jvm-internal-names.js';
 import { synthesizeReceiverChainCapture } from '../../utils/receiver-chain-captures.js';
 import { captureJavaSpringAopFacts, type JavaSpringAopFact } from './spring-aop.js';
 import {
@@ -445,6 +447,7 @@ export function emitJavaScopeCaptures(
   setJavaSpringDynamicLookupFacts(filePath, springDynamicLookupFacts);
   setJavaSpringNonHttpHandlerFacts(filePath, springNonHttpHandlerFacts);
   setJavaSpringMessageProducerFacts(filePath, springMessageProducerFacts);
+  setJavaJvmNameFacts(filePath, captureJavaJvmNameFacts(tree.rootNode));
 
   return [
     ...resolveVarTypeBindings(out),
