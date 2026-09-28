@@ -42,7 +42,7 @@ const LUA_CALLABLE_CAPTURE_OPTIONS = {
     'function_definition',
   ]),
   callNodeTypes: new Set(['call']),
-  parameterListNodeTypes: new Set(['parameters', 'parameter_list', 'argument_list']),
+  parameterListNodeTypes: new Set(['parameter_list', 'argument_list']),
   parameterNodeTypes: new Set(['identifier', 'vararg_expression']),
   bindingNodeTypes: new Set(['local_variable_declaration']),
   assignmentNodeTypes: new Set(['variable_assignment']),

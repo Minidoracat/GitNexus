@@ -74,6 +74,10 @@ const GRAMMAR_PACKAGES: Partial<Record<SupportedLanguages, { pkg: string; subpat
     pkg: 'tree-sitter-zig',
     subpaths: ['src/node-types.json'],
   },
+  [SupportedLanguages.Lua]: {
+    pkg: 'tree-sitter-lua',
+    subpaths: ['src/node-types.json'],
+  },
 };
 
 /** Languages the gate validates (everything with a grammar package). */
@@ -109,7 +113,7 @@ interface NodeTypeEntry {
 
 /** Resolve the on-disk directory of an installed package, or null if absent. */
 function resolvePackageDir(pkg: string): string | null {
-  // Vendored grammars (c/dart/proto/swift/kotlin/objc/zig) are NOT in node_modules — they
+  // Vendored grammars (c/dart/proto/swift/kotlin/objc/zig/lua) are NOT in node_modules — they
   // load from vendor/ by absolute path (vendored-grammars.ts / #2111), so resolve
   // their node-types.json from there rather than via _require.resolve.
   if (VENDORED_GRAMMAR_PACKAGES.has(pkg)) {

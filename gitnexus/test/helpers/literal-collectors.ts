@@ -89,6 +89,7 @@ const DIR_LANG: Record<string, SupportedLanguages> = {
   dart: SupportedLanguages.Dart,
   vue: SupportedLanguages.Vue,
   zig: SupportedLanguages.Zig,
+  lua: SupportedLanguages.Lua,
 };
 
 /** Basename (no .ts) → language set, for extractor files that name a language. */
@@ -113,6 +114,7 @@ const BASENAME_LANGS: Record<string, SupportedLanguages[]> = {
   expo: [SupportedLanguages.TypeScript, SupportedLanguages.JavaScript],
   'fastapi-router-bindings': [SupportedLanguages.Python],
   zig: [SupportedLanguages.Zig],
+  lua: [SupportedLanguages.Lua],
 };
 
 /** const-name prefix → language (for export-detection.ts style named sets). */
@@ -131,6 +133,7 @@ const PREFIX_LANGS: Record<string, SupportedLanguages[]> = {
   TS: [SupportedLanguages.TypeScript],
   JS: [SupportedLanguages.JavaScript],
   ZIG: [SupportedLanguages.Zig],
+  LUA: [SupportedLanguages.Lua],
 };
 
 /** Candidate grammar languages a CODE literal in `relPath` should be checked against. */
