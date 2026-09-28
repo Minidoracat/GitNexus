@@ -763,7 +763,17 @@ import { copyV8CacheIfPresent, tryLoadV8Cache, writeV8CacheFile } from './v8-sid
 // #3190. Old durable ParsedFiles lack the facts needed for scoped binding;
 // invalidate both stores so warm indexing actually applies the correction.
 // origin/main took 98 for #3219; 99 is the next free value.
-const SCHEMA_BUMP = 99;
+// v100 (fork feat/lua-pz, on v1.6.12): the Lua provider's captures and capture
+// side channel changed shape — table members carry dotted qualified/binding
+// names and `@declaration.is-exported`, every `function_definition` is a
+// scope, bare and member calls carry `@reference.qualified-name` path keys,
+// factory classes and `self` type bindings are new, and the side channel
+// drops `callableAliases` for `defKeys` / `classKeys` / `localOnlyCallees` /
+// return keys. A warm v99 cache replays unchanged `.lua` files with none of
+// these facts, so every Lua fix would be inert until a source edit.
+// NOTE for a rebase onto upstream main: upstream already used 100–117 at the
+// same package version, so re-pick the next value above upstream's then.
+const SCHEMA_BUMP = 100;
 const GITNEXUS_PKG_VERSION = (() => {
   try {
     // package.json sits at gitnexus/package.json — two levels up from

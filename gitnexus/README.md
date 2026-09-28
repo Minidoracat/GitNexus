@@ -439,12 +439,18 @@ TypeScript, JavaScript, Python, Java, C, C++, C#, Go, Rust, PHP, Kotlin, Swift, 
 | C++        | —       | —              | ✓       | ✓        | ✓                | ✓                     | —      | ✓          | ✓            |
 | Dart       | ✓       | —              | ✓       | ✓        | ✓                | ✓                     | —      | ✓          | ✓            |
 | Lua        | ✓       | ✓              | ✓       | ✓*      | —                | —                     | —      | —          | —            |
-
-Lua heritage currently covers middleclass-style `EXTENDS` and `HAS_METHOD`
-edges, generic MRO dispatch, conservative callable-value flow, and non-narrowing
-arity handling. It does not yet claim `__base` super-call, constructor/type,
-framework, or entry-point inference.
 | Zig        | ✓       | —              | ✓       | —        | ✓                | ✓                     | ✓      | —          | ✓            |
+
+\* Lua heritage covers middleclass `class("Name", Parent)` and method-call
+class factories (`X = Base:derive("X")`, `Base:extend()`,
+`Base:subclass("X")`): `EXTENDS`, `HAS_METHOD` (including methods defined in
+another file), MRO dispatch for `self:m()` and `Parent.m(self)`, and
+middleclass `__base` calls. Cross-file calls follow Lua's global tables —
+`MyMod = MyMod or {}`, local aliases (`local C = MyMod.Client`) and local tables
+registered under a global path (`C.Tx = P`) — without needing `require`
+bindings; a bare name never reaches a table member or another file's `local`
+function. Constructor/type, framework and entry-point inference are not
+claimed.
 
 **Imports** — cross-file import resolution · **Named Bindings** — `import { X as Y }` / re-export tracking · **Exports** — public/exported symbol detection · **Heritage** — class inheritance, interfaces, mixins · **Type Annotations** — explicit type extraction for receiver resolution · **Constructor Inference** — infer receiver type from constructor calls (`self`/`this` resolution included for all languages) · **Config** — language toolchain config parsing (tsconfig, go.mod, etc.) · **Frameworks** — AST-based framework pattern detection · **Entry Points** — entry point scoring heuristics
 
