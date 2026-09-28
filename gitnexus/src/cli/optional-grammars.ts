@@ -4,14 +4,16 @@
  * tree-sitter-dart, -proto, -swift, -kotlin, and -zig are vendored under
  * vendor/ and loaded from there by absolute path (NEVER copied into
  * node_modules — see core/tree-sitter/vendored-grammars.ts / #2111). Each
- * ships committed platform prebuilds activated via node-gyp-build. All can
+ * ships committed platform prebuilds activated via node-gyp-build.
+ * tree-sitter-lua is also vendored, but is source-built during install
+ * because it does not currently ship committed prebuilds. All can
  * be skipped via GITNEXUS_SKIP_OPTIONAL_GRAMMARS=1 (postinstall scripts), or
  * can silently soft-fail when no prebuild matches the host platform (and a
  * source build was unavailable / not attempted).
  *
  * Either path produces the same observable: the .node binding is absent
  * at runtime. This helper detects that condition and surfaces a single
- * stderr line per missing grammar so users learn why .dart/.proto/.swift/.kt/.zig
+ * stderr line per missing grammar so users learn why .dart/.proto/.swift/.kt/.zig/.lua
  * support is unavailable instead of silently getting a degraded index.
  */
 
@@ -34,6 +36,7 @@ interface OptionalGrammar {
    * `.proto`, which is a gRPC-extractor concern, not a SupportedLanguages.
    */
   language?: SupportedLanguages;
+
 }
 
 const OPTIONAL_GRAMMARS: OptionalGrammar[] = [
@@ -43,7 +46,11 @@ const OPTIONAL_GRAMMARS: OptionalGrammar[] = [
     extensions: ['.dart'],
     language: SupportedLanguages.Dart,
   },
-  { name: 'tree-sitter-proto', pkg: 'tree-sitter-proto', extensions: ['.proto'] },
+  {
+    name: 'tree-sitter-proto',
+    pkg: 'tree-sitter-proto',
+    extensions: ['.proto'],
+  },
   {
     name: 'tree-sitter-swift',
     pkg: 'tree-sitter-swift',
@@ -61,6 +68,13 @@ const OPTIONAL_GRAMMARS: OptionalGrammar[] = [
     pkg: 'tree-sitter-zig',
     extensions: ['.zig'],
     language: SupportedLanguages.Zig,
+
+  },
+  {
+    name: 'tree-sitter-lua',
+    pkg: 'tree-sitter-lua',
+    extensions: ['.lua'],
+    language: SupportedLanguages.Lua,
   },
 ];
 
@@ -107,7 +121,11 @@ export function detectMissingOptionalGrammars(): MissingGrammar[] {
     // treated as unavailable, with a `skipped` reason so the warning says so
     // instead of suggesting a reinstall (#2101 review).
     if (g.language !== undefined && isGrammarRuntimeSkipped(g.language)) {
-      missing.push({ name: g.name, extensions: g.extensions, reason: 'skipped' });
+      missing.push({
+        name: g.name,
+        extensions: g.extensions,
+        reason: 'skipped',
+      });
       continue;
     }
     try {
@@ -131,7 +149,11 @@ export function detectMissingOptionalGrammars(): MissingGrammar[] {
           { grammar: g.name, extensions: g.extensions, error: msg },
         );
       }
-      missing.push({ name: g.name, extensions: g.extensions, reason: 'missing' });
+      missing.push({
+        name: g.name,
+        extensions: g.extensions,
+        reason: 'missing',
+      });
     }
   }
   return missing;

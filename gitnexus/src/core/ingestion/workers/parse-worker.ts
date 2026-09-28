@@ -83,6 +83,10 @@ try {
   C = requireVendoredGrammar('tree-sitter-c') as TreeSitterLanguage;
 } catch {}
 
+let Lua: TreeSitterLanguage | null = null;
+try {
+  Lua = requireVendoredGrammar('tree-sitter-lua') as TreeSitterLanguage;
+} catch {}
 let Zig: TreeSitterLanguage | null = null;
 try {
   Zig = requireVendoredGrammar('tree-sitter-zig') as TreeSitterLanguage;
@@ -572,6 +576,7 @@ const languageMap: Record<string, TreeSitterLanguage> = {
   [SupportedLanguages.Vue]: TypeScript.typescript,
   ...(Dart ? { [SupportedLanguages.Dart]: Dart } : {}),
   ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
+  ...(Lua ? { [SupportedLanguages.Lua]: Lua } : {}),
   ...(Zig ? { [SupportedLanguages.Zig]: Zig } : {}),
 };
 

@@ -53,6 +53,7 @@ const EXTENSION_MAP: Record<SupportedLanguages, readonly string[]> = {
   [SupportedLanguages.Swift]: ['.swift'],
   [SupportedLanguages.Dart]: ['.dart'],
   [SupportedLanguages.Vue]: ['.vue'],
+  [SupportedLanguages.Lua]: ['.lua'],
   [SupportedLanguages.Cobol]: ['.cbl', '.cob', '.cpy', '.cobol'],
   [SupportedLanguages.Zig]: ['.zig'],
 } satisfies Record<SupportedLanguages, readonly string[]>; // Ensure exhaustiveness
@@ -123,6 +124,7 @@ const SYNTAX_MAP: Record<SupportedLanguages, string> = {
   [SupportedLanguages.Swift]: 'swift',
   [SupportedLanguages.Dart]: 'dart',
   [SupportedLanguages.Vue]: 'typescript',
+  [SupportedLanguages.Lua]: 'lua',
   [SupportedLanguages.Cobol]: 'cobol',
   [SupportedLanguages.Zig]: 'zig',
 } satisfies Record<SupportedLanguages, string>; // Ensure exhaustiveness
