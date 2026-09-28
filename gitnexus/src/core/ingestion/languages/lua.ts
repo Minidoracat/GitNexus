@@ -1,28 +1,29 @@
 /**
  * Lua language provider.
  *
- * Phase A (legacy DAG): emits Function/Method DEFINITION nodes from
+ * Phase A (legacy DAG): emits Function/Method/Class DEFINITION nodes from
  * LUA_QUERIES — `function foo()`, `local function foo()`, `function Obj:m()`
- * / `function Obj.m()`.
+ * / `function Obj.m()`, single-target `f = function` / `T.f = function`, and
+ * middleclass / `Base:derive("X")`-style classes.
  *
  * Phase B1 (scope resolution): `emitScopeCaptures` (lua/captures.ts) runs the
  * scope query (lua/query.ts) and the central ScopeExtractor builds the scope
  * tree + declarations + imports + reference sites. `interpretImport` turns
  * require()'s `@import.source` into a `namespace` ParsedImport when a local
  * binding is captured (`local X = require(...)`) so `X.foo()` resolves across
- * files, or `wildcard` for bare side-effect requires; the legacy
- * `importResolver` (luaRequireStrategy / suffixResolve) is bridged to resolve
- * `targetRaw` → file (no separate resolveImportTarget needed, mirroring
- * Ruby). This unlocks CALLS edges (from @reference.call.*) and IMPORTS edges.
+ * files, or `wildcard` for bare side-effect requires. `interpretTypeBinding`
+ * types `self` in a colon method of a class declared in the same file.
  *
- * `collectCaptureSideChannel` snapshots middleclass heritage pairs
- * (`class("Name", Parent)` + `function Obj:m()`) collected in the worker onto
- * `ParsedFile.captureSideChannel`, so `emitLuaHeritageEdges` emits EXTENDS +
- * HAS_METHOD on the main thread without re-reading or re-parsing (#1983).
+ * Lua visibility and module tables are computed in the worker by
+ * lua/path-env.ts (block-scoped locals, global table paths such as
+ * `MyMod.Client.Tx.create`, local aliases, registrations `C.Tx = P`) and
+ * resolved workspace-wide by lua/path-index.ts through the ScopeResolver.
  *
- * Pending: middleclass `__base` super-call resolution (Phase B2), plus
- * constructor/type/framework/entry-point inference outside this provider's
- * current scope.
+ * `collectCaptureSideChannel` snapshots those facts plus class heritage pairs
+ * (`class("Name", Parent)`, `Parent:derive("Name")`, `function Obj:m()`) onto
+ * `ParsedFile.captureSideChannel`, so the resolver hooks and
+ * `emitLuaHeritageEdges` work on the main thread without re-reading or
+ * re-parsing (#1983).
  */
 import { SupportedLanguages } from 'gitnexus-shared';
 import { defineLanguage } from '../language-provider.js';
@@ -35,7 +36,7 @@ import { createCallExtractor } from '../call-extractors/generic.js';
 import { luaCallConfig } from '../call-extractors/configs/lua.js';
 import { assertCloneable } from '../workers/clone-safety.js';
 import { collectLuaCaptureSideChannel } from './lua/capture-side-channel.js';
-import { emitLuaScopeCaptures, interpretLuaImport } from './lua/index.js';
+import { emitLuaScopeCaptures, interpretLuaImport, interpretLuaTypeBinding } from './lua/index.js';
 
 export const luaProvider = defineLanguage({
   id: SupportedLanguages.Lua,
@@ -48,4 +49,5 @@ export const luaProvider = defineLanguage({
   emitScopeCaptures: emitLuaScopeCaptures,
   collectCaptureSideChannel: (filePath) => assertCloneable(collectLuaCaptureSideChannel(filePath)),
   interpretImport: interpretLuaImport,
+  interpretTypeBinding: interpretLuaTypeBinding,
 });

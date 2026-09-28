@@ -32,7 +32,12 @@ import { luaProvider } from '../lua.js';
 import { emitLuaHeritageEdges } from './heritage.js';
 import { definitionIdPosition } from '../../scope-resolution/utils/definition-id.js';
 import { clearLuaHeritageFacts, type LuaCaptureSideChannel } from './capture-side-channel.js';
-import { buildLuaPathIndex, resolveLuaPathKey, type LuaPathIndex } from './path-index.js';
+import {
+  assignLuaWorkspaceOwners,
+  buildLuaPathIndex,
+  resolveLuaPathKey,
+  type LuaPathIndex,
+} from './path-index.js';
 
 // Cache the suffix index across calls within one analyze run — `allFilePaths`
 // is the same ReadonlySet for every Lua import in the run, so keying on its
@@ -153,7 +158,7 @@ function resolveLuaPathSite(
   scopes: ScopeResolutionIndexes,
 ): SymbolDefinition | undefined {
   if (key === undefined || luaPathIndex === undefined) return undefined;
-  const defs = resolveLuaPathKey(luaPathIndex, filePath, key, scopes);
+  const defs = resolveLuaPathKey(luaPathIndex, luaPathIndex.callables, filePath, key, scopes);
   return defs.length === 1 ? defs[0] : undefined;
 }
 
@@ -264,6 +269,7 @@ const luaScopeResolver: ScopeResolver = {
   populateOwners: populateLuaOwners,
   populateWorkspaceOwners: (parsedFiles) => {
     luaPathIndex = buildLuaPathIndex(parsedFiles);
+    assignLuaWorkspaceOwners(luaPathIndex);
   },
 
   // middleclass exposes the parent class as `Class.__base`; the qualified
@@ -277,7 +283,8 @@ const luaScopeResolver: ScopeResolver = {
   // middleclass `class("Name", Parent)` — emits EXTENDS. middleclass has no
   // syntactic class body, so lexical heritage cannot produce these; the hook
   // consumes the capture side-channel's class() facts.
-  emitHeritageEdges: emitLuaHeritageEdges,
+  emitHeritageEdges: (graph, parsedFiles, nodeLookup, scopes) =>
+    emitLuaHeritageEdges(graph, parsedFiles, nodeLookup, scopes, luaPathIndex),
 
   // Lua has globals (`function foo()` is global) — let unresolved free calls
   // fall back to the global symbol table. Only true globals are candidates:

@@ -17,7 +17,7 @@
  * Local callable values and callback arguments are handled by the Lua capture
  * provider; receiver aliases that depend on table shape remain conservative.
  */
-import type { CaptureMatch, ParsedImport } from 'gitnexus-shared';
+import type { CaptureMatch, ParsedImport, ParsedTypeBinding } from 'gitnexus-shared';
 
 function stripLuaString(s: string): string {
   const long = s.match(/^\[(=*)\[([\s\S]*)\]\1\]$/);
@@ -42,4 +42,15 @@ export function interpretLuaImport(captures: CaptureMatch): ParsedImport | null 
     return { kind: 'namespace', localName, importedName, targetRaw };
   }
   return { kind: 'wildcard', targetRaw };
+}
+
+/**
+ * The only Lua type binding: `self` inside `function X:m()` when `X` is a
+ * class declared in the same file (synthesized by captures.ts). Lua has no
+ * type annotations, so nothing else is ever bound.
+ */
+export function interpretLuaTypeBinding(captures: CaptureMatch): ParsedTypeBinding | null {
+  const type = captures['@type-binding.type']?.text;
+  if (captures['@type-binding.self'] === undefined || type === undefined) return null;
+  return { boundName: 'self', rawTypeName: type, source: 'self' };
 }

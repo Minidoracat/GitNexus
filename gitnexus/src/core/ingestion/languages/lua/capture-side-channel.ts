@@ -12,10 +12,14 @@
 import type { LuaDefKeys } from './path-env.js';
 
 export interface LuaExtendsPair {
-  /** Child class name (quotes stripped from the `class("Name", ...)` string arg). */
+  /** Child class name (quotes stripped from `class("Name", ...)`; the bound
+   *  name for a `Base:derive(...)` factory class). */
   readonly child: string;
-  /** Parent class identifier (bare `variable name:` in the 2nd arg). */
+  /** Parent as written (bare `Parent`, `mod.Parent`, or the factory receiver). */
   readonly parent: string;
+  /** Table-path keys of a factory class's receiver, resolved against the
+   *  workspace class index before any name-based lookup. */
+  readonly parentKeys?: readonly string[];
 }
 
 export interface LuaMethodOwnerPair {
@@ -47,6 +51,8 @@ export interface LuaCaptureSideChannel {
    * by def anchor. The resolver indexes these workspace-wide.
    */
   readonly defKeys: readonly LuaDefKeys[];
+  /** Table-path keys of every factory class, by its declaration anchor. */
+  readonly classKeys: readonly LuaDefKeys[];
   /** Keys of the table the chunk's `return` exposes (`return P`). */
   readonly returnKeys: readonly string[];
   /** Keys per field when the chunk returns a table constructor (`return { f = f }`). */

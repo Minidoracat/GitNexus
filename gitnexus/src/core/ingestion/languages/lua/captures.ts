@@ -461,6 +461,24 @@ export function emitLuaScopeCaptures(
   // string-call forms without producing a cross-product of captures.
   out.push(...collectLuaImportCaptures(tree.rootNode));
   out.push(...collectLuaAssignedFunctionCaptures(tree.rootNode, facts));
+  // Method-call class factories (`X = ISPanel:derive("X")`, `Base:extend()`,
+  // `Base:subclass("X")`): the bound name is the class, as for middleclass.
+  for (const { statement, name, isLocal } of facts.factoryClasses) {
+    out.push({
+      '@declaration.class': nodeToCapture('@declaration.class', statement),
+      '@declaration.name': nodeToCapture('@declaration.name', name),
+      '@declaration.is-exported': syntheticCapture('@declaration.is-exported', name, String(!isLocal)),
+    });
+  }
+  // `self` inside `function X:m()` is an `X` (anchored on the body so the
+  // binding lives in the method's own scope, not the enclosing one).
+  for (const [body, className] of facts.selfTypes) {
+    out.push({
+      '@type-binding.self': syntheticCapture('@type-binding.self', body, 'self'),
+      '@type-binding.name': syntheticCapture('@type-binding.name', body, 'self'),
+      '@type-binding.type': syntheticCapture('@type-binding.type', body, className),
+    });
+  }
   out.push(...synthesizeCallableFlowCaptures(tree.rootNode, LUA_CALLABLE_CAPTURE_OPTIONS));
 
   // Heritage pairs (middleclass EXTENDS + HAS_METHOD) — collected here in the
@@ -479,6 +497,9 @@ export function emitLuaScopeCaptures(
     if (child.length > 0 && parent !== undefined) {
       extendsPairs.push({ child, parent });
     }
+  }
+  for (const { name, parentText, parentKeys } of facts.factoryClasses) {
+    if (parentText.length > 0) extendsPairs.push({ child: name.text, parent: parentText, parentKeys });
   }
   const methodOwners: LuaMethodOwnerPair[] = [];
   for (const m of getMethodOwnerQuery().matches(tree.rootNode)) {
@@ -506,7 +527,8 @@ export function emitLuaScopeCaptures(
     classNames.has(name),
   );
   const returnedFields = collectLuaReturnedFields(tree.rootNode);
-  const { localOnlyCallees, defKeys, returnKeys, returnFields: returnFieldKeys } = facts;
+  const { localOnlyCallees, defKeys, classKeys, returnKeys } = facts;
+  const returnFieldKeys = facts.returnFields;
   if (
     extendsPairs.length > 0 ||
     methodOwners.length > 0 ||
@@ -514,6 +536,7 @@ export function emitLuaScopeCaptures(
     returnedFields.length > 0 ||
     localOnlyCallees.length > 0 ||
     defKeys.length > 0 ||
+    classKeys.length > 0 ||
     returnKeys.length > 0 ||
     Object.keys(returnFieldKeys).length > 0
   ) {
@@ -525,6 +548,7 @@ export function emitLuaScopeCaptures(
       returnedFields,
       localOnlyCallees,
       defKeys,
+      classKeys,
       returnKeys,
       returnFieldKeys,
     });

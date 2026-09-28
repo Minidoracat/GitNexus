@@ -1,14 +1,19 @@
 /**
- * Lua middleclass heritage edges — EXTENDS + HAS_METHOD.
+ * Lua class heritage edges — EXTENDS + HAS_METHOD.
  *
- * middleclass has no syntactic class body — `class("Name", Parent)` is a plain
- * call, and methods are file-top-level `function Name:method()`. So neither
- * lexical heritage nor lexical HAS_METHOD applies. This hook reads the
- * heritage pairs that `emitLuaScopeCaptures` stashed onto
- * `ParsedFile.captureSideChannel` (collected in the parse worker where the AST
- * was live) and emits:
- *   - EXTENDS from the child Class node to the parent Class node, and
- *   - HAS_METHOD from a class's Class node to its file-top-level Method nodes.
+ * Lua classes have no syntactic class body — middleclass `class("Name",
+ * Parent)` and the method-call factories `Parent:derive("Name")` /
+ * `:extend()` / `:subclass()` are plain calls, and methods are file-top-level
+ * `function Name:method()`. So neither lexical heritage nor lexical HAS_METHOD
+ * applies. This hook reads the heritage pairs that `emitLuaScopeCaptures`
+ * stashed onto `ParsedFile.captureSideChannel` (collected in the parse worker
+ * where the AST was live) and emits:
+ *   - EXTENDS from the child Class node to the parent Class node — a factory
+ *     class's parent is first looked up by its table-path keys in the
+ *     workspace class index, so `local B = MyUI.Button; B:derive("X")` finds
+ *     the class registered under `MyUI.Button` in another file;
+ *   - HAS_METHOD from a class's Class node to its file-top-level Method nodes,
+ *     and to members in other files that the workspace owner pass attached.
  * Both resolve via `nodeLookup` and finalized scope bindings. NO file re-read or re-parse
  * (#1983 no-main-thread-re-parse contract).
  *
@@ -31,12 +36,14 @@ import type { KnowledgeGraph } from '../../../graph/types.js';
 import { generateId } from '../../../../lib/utils.js';
 import type { LuaCaptureSideChannel } from './capture-side-channel.js';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
+import { resolveLuaPathKey, type LuaPathIndex } from './path-index.js';
 
 export function emitLuaHeritageEdges(
   graph: KnowledgeGraph,
   parsedFiles: readonly ParsedFile[],
   nodeLookup: GraphNodeLookup,
   scopes?: ScopeResolutionIndexes,
+  pathIndex?: LuaPathIndex,
 ): void {
   const parsedByFile = new Map(parsedFiles.map((parsed) => [parsed.filePath, parsed]));
 
@@ -95,14 +102,27 @@ export function emitLuaHeritageEdges(
     const channel = parsed.captureSideChannel as LuaCaptureSideChannel | undefined;
     if (channel === undefined || channel.kind !== 'lua') continue;
 
-    // ── EXTENDS: class("Name", Parent) ──────────────────────────────────────
-    for (const { child, parent } of channel.extendsPairs) {
+    // ── EXTENDS: class("Name", Parent) / Parent:derive("Name") ───────────────
+    for (const { child, parent, parentKeys } of channel.extendsPairs) {
       const childGid = graphIdByFileAndName.get(`${parsed.filePath}::${child}`);
       if (childGid === undefined || scopes === undefined) continue;
-      const parentDef = parent.includes('.')
-        ? resolveImportedClass(parsed, parent)
-        : (resolveInheritanceBaseInScope(parsed.moduleScope, parent, scopes) ??
-          resolveImportedClass(parsed, parent));
+      const keyed =
+        pathIndex === undefined
+          ? []
+          : [
+              ...new Set(
+                (parentKeys ?? []).flatMap((key) =>
+                  resolveLuaPathKey(pathIndex, pathIndex.classes, parsed.filePath, key, scopes),
+                ),
+              ),
+            ];
+      const parentDef =
+        keyed.length === 1
+          ? keyed[0]
+          : parent.includes('.')
+            ? resolveImportedClass(parsed, parent)
+            : (resolveInheritanceBaseInScope(parsed.moduleScope, parent, scopes) ??
+              resolveImportedClass(parsed, parent));
       if (parentDef === undefined) continue;
       const parentGid = resolveDefGraphId(parentDef.filePath, parentDef, nodeLookup);
       if (parentGid === undefined) continue;
@@ -115,7 +135,10 @@ export function emitLuaHeritageEdges(
         targetId: parentGid,
         type: 'EXTENDS',
         confidence: 0.85,
-        reason: 'lua-scope: middleclass inherits',
+        reason:
+          parentKeys === undefined
+            ? 'lua-scope: middleclass inherits'
+            : 'lua-scope: class factory inherits',
       });
     }
 
@@ -154,6 +177,34 @@ export function emitLuaHeritageEdges(
         type: 'HAS_METHOD',
         confidence: 0.85,
         reason: 'lua-scope: middleclass method owner',
+      });
+    }
+  }
+
+  // ── HAS_METHOD for members the workspace owner pass attached to a class
+  //    declared elsewhere (`function MyUI.Button:onClick()` in another file). ─
+  const classDefsById = new Map<string, SymbolDefinition>();
+  for (const parsed of parsedFiles) {
+    for (const def of parsed.localDefs) if (isClassLike(def.type)) classDefsById.set(def.nodeId, def);
+  }
+  for (const parsed of parsedFiles) {
+    for (const def of parsed.localDefs) {
+      if (def.type !== 'Method' || def.ownerId === undefined) continue;
+      const owner = classDefsById.get(def.ownerId);
+      if (owner === undefined) continue;
+      const classGid = resolveDefGraphId(owner.filePath, owner, nodeLookup);
+      const methodGid = resolveDefGraphId(def.filePath, def, nodeLookup);
+      if (classGid === undefined || methodGid === undefined) continue;
+      const edgeKey = `${classGid}->${methodGid}`;
+      if (emittedHasMethod.has(edgeKey)) continue;
+      emittedHasMethod.add(edgeKey);
+      graph.addRelationship({
+        id: generateId('HAS_METHOD', edgeKey),
+        sourceId: classGid,
+        targetId: methodGid,
+        type: 'HAS_METHOD',
+        confidence: 0.85,
+        reason: 'lua-scope: class method owner',
       });
     }
   }

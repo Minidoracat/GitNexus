@@ -1310,3 +1310,118 @@ function ISFoo.bar(self, ...) return orig(self, ...) end
     );
   }, 60000);
 });
+
+// ---------------------------------------------------------------------------
+// Method-call class factories: `X = Base:derive("X")` (Project Zomboid's
+// ISBaseObject), `Base:extend()`, `Base:subclass("X")` — Class + EXTENDS +
+// HAS_METHOD, `self` typed as the class, super calls `Parent.m(self)`.
+// ---------------------------------------------------------------------------
+
+describe('Lua scope: class factories', () => {
+  it('derives classes in one file with methods, self calls and super calls', async () => {
+    await withLuaFixture(
+      {
+        'm/media/lua/client/hud.lua': `Tip = ISButton:derive("Tip")
+function Tip:new(x) local o = ISButton.new(self, x, 0, 1, 1); return o end
+function Tip:updateTooltip() end
+function Tip:prerender() self:updateTooltip() end
+Cap = Tip:derive("Cap")
+function Cap:render() Tip.prerender(self) end
+function Cap:draw() self:updateTooltip() end
+`,
+      },
+      (result) => {
+        expect(getNodesByLabel(result, 'Class')).toEqual(expect.arrayContaining(['Tip', 'Cap']));
+        expect(
+          getRelationships(result, 'EXTENDS').map((edge) => `${edge.source} -> ${edge.target}`),
+        ).toEqual(['Cap -> Tip']);
+        expect(
+          getRelationships(result, 'HAS_METHOD')
+            .map((edge) => `${edge.source}.${edge.target}`)
+            .sort(),
+        ).toEqual(['Cap.draw', 'Cap.render', 'Tip.new', 'Tip.prerender', 'Tip.updateTooltip']);
+        expect(callsBetween(result, 'prerender', 'updateTooltip')).toEqual([
+          'prerender -> updateTooltip@hud.lua',
+        ]);
+        // Inherited through Cap -> Tip.
+        expect(callsBetween(result, 'draw', 'updateTooltip')).toEqual([
+          'draw -> updateTooltip@hud.lua',
+        ]);
+        expect(callsBetween(result, 'render', 'prerender')).toEqual(['render -> prerender@hud.lua']);
+        // `ISButton.new(self, …)` is the engine's constructor, not Tip:new.
+        expect(callsBetween(result, 'new', 'new')).toEqual([]);
+      },
+    );
+  }, 60000);
+
+  it('extends a local class registered under a global path in another file', async () => {
+    await withLuaFixture(
+      {
+        'm/media/lua/client/w.lua': `local U = {}
+MyUI = U
+local Button = ISButton:derive("MyButton")
+function Button:onClick() end
+U.Button = Button
+return U
+`,
+        'm/media/lua/client/p.lua': `local Btn = MyUI.Button
+local Fancy = Btn:derive("Fancy")
+function Fancy:onPress() Btn.onClick(self) end
+`,
+      },
+      (result) => {
+        const classes = getNodesByLabel(result, 'Class');
+        expect(classes).toEqual(expect.arrayContaining(['Button', 'Fancy']));
+        expect(classes).not.toContain('MyButton');
+        expect(
+          getRelationships(result, 'EXTENDS').map(
+            (edge) =>
+              `${edge.source}@${path.basename(edge.sourceFilePath)} -> ${edge.target}@${path.basename(edge.targetFilePath)}`,
+          ),
+        ).toEqual(['Fancy@p.lua -> Button@w.lua']);
+        expect(callsBetween(result, 'onPress', 'onClick')).toEqual(['onPress -> onClick@w.lua']);
+      },
+    );
+  }, 60000);
+
+  it('owns a method defined on a global class from another file', async () => {
+    await withLuaFixture(
+      {
+        'm/media/lua/client/h.lua': 'Panel = ISPanel:derive("Panel")\nfunction Panel:base() end\n',
+        'm/media/lua/client/ext.lua': 'function Panel:extra() self:base() end\n',
+      },
+      (result) => {
+        expect(
+          getRelationships(result, 'HAS_METHOD')
+            .map((edge) => `${edge.source}.${edge.target}@${path.basename(edge.targetFilePath)}`)
+            .sort(),
+        ).toEqual(['Panel.base@h.lua', 'Panel.extra@ext.lua']);
+        expect(callsBetween(result, 'extra', 'base')).toEqual(['extra -> base@h.lua']);
+      },
+    );
+  }, 60000);
+
+  it('leaves an engine parent and an engine super call unresolved', async () => {
+    await withLuaFixture(
+      {
+        'x.lua': 'P = ISPanel:derive("P")\nfunction P:render() ISPanel.render(self) end\n',
+      },
+      (result) => {
+        expect(getNodesByLabel(result, 'Class')).toContain('P');
+        expect(getRelationships(result, 'EXTENDS')).toEqual([]);
+        expect(callsBetween(result, 'render', 'render')).toEqual([]);
+      },
+    );
+  }, 60000);
+
+  it('does not mint a class from a multi-assignment', async () => {
+    await withLuaFixture(
+      {
+        'x.lua': 'local A, B = ISPanel:derive("A"), 1\nfunction A:render() end\n',
+      },
+      (result) => {
+        expect(getNodesByLabel(result, 'Class')).not.toContain('A');
+      },
+    );
+  }, 60000);
+});

@@ -74,12 +74,52 @@ export interface LuaLexicalFacts {
   readonly localOnlyCallees: readonly string[];
 }
 
+/**
+ * A class minted by a method-call factory — `X = Base:derive("X")`
+ * (Project Zomboid's ISBaseObject), `Base:extend()` (rxi/classic),
+ * `Base:subclass("X")` (middleclass) — bound to a single simple name.
+ */
+export interface LuaFactoryClass {
+  /** The declaration statement — the Class def and graph node anchor. */
+  readonly statement: SyntaxNode;
+  /** The bound name, which is the class identity (as for `local X = class("X")`). */
+  readonly name: SyntaxNode;
+  readonly isLocal: boolean;
+  /** The factory's receiver as written (`ISPanel`, `U.Button`). */
+  readonly parentText: string;
+  /** Path keys of the receiver; empty when it is not a static path. */
+  readonly parentKeys: readonly string[];
+}
+
 export interface LuaPathFacts extends LuaLexicalFacts {
   readonly defKeys: readonly LuaDefKeys[];
+  /** Path keys of every factory class, by its statement anchor. */
+  readonly classKeys: readonly LuaDefKeys[];
+  readonly factoryClasses: readonly LuaFactoryClass[];
+  /** Colon-method bodies whose `self` is a class declared in this file: body → class name. */
+  readonly selfTypes: ReadonlyMap<SyntaxNode, string>;
   /** Call node `startIndex:endIndex` → the path key the callee names. */
   readonly callKeys: ReadonlyMap<string, string>;
   readonly returnKeys: readonly string[];
   readonly returnFields: Readonly<Record<string, readonly string[]>>;
+}
+
+/** Receiver methods that mint a subclass table (see {@link LuaFactoryClass}). */
+const CLASS_FACTORY_METHODS: Readonly<Record<string, true>> = {
+  derive: true,
+  extend: true,
+  subclass: true,
+};
+
+/** `Base:derive(...)` / `:extend` / `:subclass` → the `Base` expression, else undefined. */
+function classFactoryReceiver(node: SyntaxNode | undefined): SyntaxNode | undefined {
+  if (node?.type !== 'call') return undefined;
+  const callee = node.childForFieldName('function');
+  const method = callee?.type === 'variable' ? callee.childForFieldName('method') : null;
+  if (method === null || method === undefined || CLASS_FACTORY_METHODS[method.text] !== true) {
+    return undefined;
+  }
+  return callee?.childForFieldName('table') ?? undefined;
 }
 
 class Env {
@@ -161,6 +201,24 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
   const calls = new Map<string, CallFact>();
   let returnSym: Sym | undefined;
   const returnFieldSyms = new Map<string, Sym>();
+  const factoryParents = new Map<number, { readonly parent: Sym; readonly text: string }>();
+  const factoryDecls: {
+    readonly statement: SyntaxNode;
+    readonly name: SyntaxNode;
+    readonly isLocal: boolean;
+    readonly tableId: number;
+  }[] = [];
+  const colonMethods: { readonly body: SyntaxNode; readonly owner: SyntaxNode; readonly sym: Sym }[] =
+    [];
+
+  const tableIdAt = (node: SyntaxNode): number => {
+    let id = tableIds.get(node.startIndex);
+    if (id === undefined) {
+      id = tableIds.size + 1;
+      tableIds.set(node.startIndex, id);
+    }
+    return id;
+  };
 
   const withField = (sym: Sym, field: string | undefined): Sym => {
     if (field === undefined) return OPAQUE;
@@ -198,11 +256,15 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
           node.childForFieldName('right')?.type === 'table'
           ? symOf(node.childForFieldName('left'), env)
           : OPAQUE;
-      case 'table': {
-        let id = tableIds.get(node.startIndex);
-        if (id === undefined) {
-          id = tableIds.size + 1;
-          tableIds.set(node.startIndex, id);
+      case 'table':
+        return { kind: 'table', id: tableIdAt(node), fields: [] };
+      case 'call': {
+        // `Base:derive("X")` mints a new class table whose parent is `Base`.
+        const receiver = classFactoryReceiver(node);
+        if (receiver === undefined) return OPAQUE;
+        const id = tableIdAt(node);
+        if (!factoryParents.has(id)) {
+          factoryParents.set(id, { parent: symOf(receiver, env), text: receiver.text });
         }
         return { kind: 'table', id, fields: [] };
       }
@@ -262,6 +324,16 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
         names.forEach((name, index) => {
           if (name !== undefined) declare(env, name.text, line, values[index] ?? UNSET);
         });
+        const [single] = values;
+        if (
+          names.length === 1 &&
+          expressions.length === 1 &&
+          names[0] !== undefined &&
+          single?.kind === 'table' &&
+          factoryParents.has(single.id)
+        ) {
+          factoryDecls.push({ statement: node, name: names[0], isLocal: true, tableId: single.id });
+        }
         return;
       }
       case 'local_function_definition_statement': {
@@ -291,7 +363,14 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
           if (member !== undefined && !isNestedInLuaFunction(node)) {
             memberDefs.push({ anchor: node, owner, member });
           }
-          if (name.childForFieldName('method') !== null) self = owner;
+          const tableNode = name.childForFieldName('table');
+          if (name.childForFieldName('method') !== null) {
+            self = owner;
+            const body = node.childForFieldName('body');
+            if (body !== null && tableNode?.type === 'identifier') {
+              colonMethods.push({ body, owner: tableNode, sym: owner });
+            }
+          }
           visit(name, env);
         }
         visitFunction(node, env, self);
@@ -313,6 +392,19 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
           const name = simpleVariableName(target);
           if (name !== undefined) {
             const decl = env.lookup(name.text);
+            if (
+              targets.length === 1 &&
+              expressions.length === 1 &&
+              value.kind === 'table' &&
+              factoryParents.has(value.id)
+            ) {
+              factoryDecls.push({
+                statement: node,
+                name,
+                isLocal: decl !== undefined,
+                tableId: value.id,
+              });
+            }
             if (decl !== undefined) {
               localIdentifierStarts.add(name.startIndex);
               decl.values.push(value);
@@ -514,6 +606,31 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
   for (const { anchor, owner, member } of memberDefs) addDef(anchor, symKeys(owner, member));
   for (const { anchor, name } of globalDefs) addDef(anchor, [name]);
 
+  const classKeys: LuaDefKeys[] = [];
+  const factoryClasses: LuaFactoryClass[] = [];
+  const classNameByKey = new Map<string, string>();
+  for (const { statement, name, isLocal, tableId } of factoryDecls) {
+    const parent = factoryParents.get(tableId);
+    const keys = tableKeys(tableId);
+    classKeys.push({ ...position(statement), keys });
+    for (const key of keys) classNameByKey.set(key, name.text);
+    factoryClasses.push({
+      statement,
+      name,
+      isLocal,
+      parentText: parent?.text ?? '',
+      parentKeys: parent === undefined ? [] : symKeys(parent.parent),
+    });
+  }
+  // `self` in `function X:m()` is typed as class `X` only when `X` is the very
+  // name a class of this file is bound to — the name the scope model resolves.
+  const selfTypes = new Map<SyntaxNode, string>();
+  for (const { body, owner, sym } of colonMethods) {
+    if (symKeys(sym).some((key) => classNameByKey.get(key) === owner.text)) {
+      selfTypes.set(body, owner.text);
+    }
+  }
+
   const callKeys = new Map<string, string>();
   for (const [callKey, fact] of calls) {
     const keys =
@@ -549,6 +666,9 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
     localIdentifierStarts,
     localOnlyCallees,
     defKeys,
+    classKeys,
+    factoryClasses,
+    selfTypes,
     callKeys,
     returnKeys: returnResolved === null ? [] : keysOf(returnResolved),
     returnFields,

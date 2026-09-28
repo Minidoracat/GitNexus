@@ -2673,6 +2673,24 @@ export const LUA_QUERIES = `
       function: (variable name: (identifier) @_middleclass)
       (#eq? @_middleclass "middleclass")))) @definition.class
 
+; ── Method-call class factories: X = Base:derive("X") / Base:extend() /
+;   Base:subclass("X"), single target and single value. The Class node is
+;   named by the bound name, like middleclass above; the scope capture anchors
+;   the declaration on the same statement.
+(local_variable_declaration
+  (variable_list . (variable name: (identifier) @name) .)
+  (expression_list
+    . value: (call
+      function: (variable method: (identifier) @_factory)) .)
+  (#match? @_factory "^(derive|extend|subclass)$")) @definition.class
+
+(variable_assignment
+  (variable_list . (variable name: (identifier) @name) .)
+  (expression_list
+    . value: (call
+      function: (variable method: (identifier) @_factory)) .)
+  (#match? @_factory "^(derive|extend|subclass)$")) @definition.class
+
 ; ── Calls: foo(), obj:bar(), obj.baz() ────────────────────────────────────────
 ;   call.function is a (variable); @call.name lands on the invoked identifier
 ;   so the generic call extractor can derive calledName + callForm + receiver.
