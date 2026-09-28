@@ -182,7 +182,9 @@ export function emitLuaHeritageEdges(
   }
 
   // ── HAS_METHOD for members the workspace owner pass attached to a class
-  //    declared elsewhere (`function MyUI.Button:onClick()` in another file). ─
+  //    declared in ANOTHER file (`function Panel:extra()` beside `Panel =
+  //    ISPanel:derive("Panel")` elsewhere). Same-file owners are the
+  //    `methodOwners` loop's above, which also owns their node fallback.
   const classDefsById = new Map<string, SymbolDefinition>();
   for (const parsed of parsedFiles) {
     for (const def of parsed.localDefs) if (isClassLike(def.type)) classDefsById.set(def.nodeId, def);
@@ -191,7 +193,7 @@ export function emitLuaHeritageEdges(
     for (const def of parsed.localDefs) {
       if (def.type !== 'Method' || def.ownerId === undefined) continue;
       const owner = classDefsById.get(def.ownerId);
-      if (owner === undefined) continue;
+      if (owner === undefined || owner.filePath === def.filePath) continue;
       const classGid = resolveDefGraphId(owner.filePath, owner, nodeLookup);
       const methodGid = resolveDefGraphId(def.filePath, def, nodeLookup);
       if (classGid === undefined || methodGid === undefined) continue;

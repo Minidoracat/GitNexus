@@ -1414,6 +1414,27 @@ function Fancy:onPress() Btn.onClick(self) end
     );
   }, 60000);
 
+  it('gives each class one HAS_METHOD when classes in a file share a method name', async () => {
+    await withLuaFixture(
+      {
+        'x.lua': `ChainButton = ISButton:derive("ChainButton")
+TipZone = ISButton:derive("TipZone")
+function TipZone:render() end
+CapZone = TipZone:derive("CapZone")
+function CapZone:render() end
+function ChainButton:render() end
+`,
+      },
+      (result) => {
+        expect(
+          getRelationships(result, 'HAS_METHOD')
+            .map((edge) => `${edge.source}.${edge.target}`)
+            .sort(),
+        ).toEqual(['CapZone.render', 'ChainButton.render', 'TipZone.render']);
+      },
+    );
+  }, 60000);
+
   it('does not mint a class from a multi-assignment', async () => {
     await withLuaFixture(
       {
