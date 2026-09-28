@@ -20,7 +20,6 @@ import type { KnowledgeGraph } from '../../../graph/types.js';
 import type { GraphNodeLookup } from '../../scope-resolution/graph-bridge/node-lookup.js';
 import { tryEmitEdge } from '../../scope-resolution/graph-bridge/edges.js';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
-import type { SemanticModel } from '../../model/semantic-model.js';
 import {
   buildSuffixIndex,
   LUA_EXTENSIONS,
@@ -32,11 +31,8 @@ import { buildMro, defaultLinearize } from '../../scope-resolution/passes/mro.js
 import { luaProvider } from '../lua.js';
 import { emitLuaHeritageEdges } from './heritage.js';
 import { definitionIdPosition } from '../../scope-resolution/utils/definition-id.js';
-import {
-  clearLuaHeritageFacts,
-  type LuaCaptureSideChannel,
-  type LuaCallableAlias,
-} from './capture-side-channel.js';
+import { clearLuaHeritageFacts, type LuaCaptureSideChannel } from './capture-side-channel.js';
+import { buildLuaPathIndex, resolveLuaPathKey, type LuaPathIndex } from './path-index.js';
 
 // Cache the suffix index across calls within one analyze run — `allFilePaths`
 // is the same ReadonlySet for every Lua import in the run, so keying on its
@@ -144,109 +140,64 @@ function resolveLuaNamespaceMember(
   return undefined;
 }
 
-function luaCallableCandidates(parsed: ParsedFile, name: string): readonly SymbolDefinition[] {
-  return parsed.localDefs.filter(
-    (def) =>
-      (def.type === 'Function' || def.type === 'Method') &&
-      (def.qualifiedName === name || def.qualifiedName?.endsWith(`.${name}`)),
-  );
-}
+// Workspace table-path index (`path-index.ts`), rebuilt by
+// `populateWorkspaceOwners` once per Lua pass — the first hook that sees every
+// ParsedFile — and read by the free-call and unresolved-receiver hooks, which
+// do not receive the file set themselves.
+let luaPathIndex: LuaPathIndex | undefined;
 
-function resolveLuaCallableAlias(
-  parsed: ParsedFile,
-  source: string,
+/** The single def a site's path key names, or undefined when none or several. */
+function resolveLuaPathSite(
+  filePath: string,
+  key: string | undefined,
   scopes: ScopeResolutionIndexes,
-  parsedFilesByPath: ReadonlyMap<string, ParsedFile>,
-): SymbolDefinition | 'ambiguous' | undefined {
-  const aliasesFor = (file: ParsedFile): ReadonlyMap<string, LuaCallableAlias> | 'ambiguous' => {
-    const out = new Map<string, LuaCallableAlias>();
-    for (const alias of (file.captureSideChannel as LuaCaptureSideChannel | undefined)
-      ?.callableAliases ?? []) {
-      if (out.has(alias.destination)) return 'ambiguous';
-      out.set(alias.destination, alias);
-    }
-    return out;
-  };
-
-  const memberCandidates = (file: ParsedFile, member: string): readonly SymbolDefinition[] =>
-    luaCallableCandidates(file, member);
-
-  const seen = new Set<string>();
-  const resolve = (
-    current: string,
-    currentParsed: ParsedFile,
-    depth: number,
-  ): SymbolDefinition | 'ambiguous' | undefined => {
-    if (depth > 16 || seen.has(`${currentParsed.filePath}:${current}`)) return undefined;
-    seen.add(`${currentParsed.filePath}:${current}`);
-
-    const aliases = aliasesFor(currentParsed);
-    if (aliases === 'ambiguous') return 'ambiguous';
-    const alias = aliases.get(current);
-    if (alias !== undefined) return resolve(alias.source, currentParsed, depth + 1);
-
-    const parts = current.split('.');
-    if (parts.length === 1) {
-      const candidates = luaCallableCandidates(currentParsed, current);
-      return candidates.length === 1
-        ? candidates[0]
-        : candidates.length > 1
-          ? 'ambiguous'
-          : undefined;
-    }
-    if (parts.length !== 2 || !parts.every((part) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(part)))
-      return undefined;
-
-    const [receiver, member] = parts;
-    const imports = (scopes.imports.get(currentParsed.moduleScope) ?? []).filter(
-      (edge) => edge.localName === receiver && edge.targetFile !== null,
-    );
-    if (imports.length > 1) return 'ambiguous';
-    const importedTarget = imports[0]?.targetFile;
-    const targetFile =
-      importedTarget === null || importedTarget === undefined
-        ? currentParsed
-        : parsedFilesByPath.get(importedTarget);
-    if (targetFile === undefined) return undefined;
-    const candidates = memberCandidates(targetFile, member);
-    return candidates.length === 1
-      ? candidates[0]
-      : candidates.length > 1
-        ? 'ambiguous'
-        : undefined;
-  };
-
-  return resolve(source, parsed, 0);
+): SymbolDefinition | undefined {
+  if (key === undefined || luaPathIndex === undefined) return undefined;
+  const defs = resolveLuaPathKey(luaPathIndex, filePath, key, scopes);
+  return defs.length === 1 ? defs[0] : undefined;
 }
 
-function emitLuaCallableAliasEdges(
+/**
+ * Calls whose callee names a table-member path (`T.f()`, `T:m()`, and a bare
+ * `f()` where `local f = MyMod.Client.f` or `local f = util.f`): resolve the
+ * path key the worker attached (`@reference.qualified-name`, encoding in
+ * `path-env.ts`) through the workspace path index.
+ *
+ * - Member calls are all claimed here, resolved or not, once the typed
+ *   receiver cases above declined them: a member is reached only through its
+ *   table, so the receiver-blind name lookup that runs next can only guess.
+ * - A bare call is taken only when its key is a member path (contains a
+ *   `.`). A plain global name (`foo`) stays with the free-call pass
+ *   (`resolveQualifiedFreeCall` below) and a local function (`@line:col`)
+ *   with the scope chain, so no site is resolved twice. The alias local is a
+ *   plain value binding, so the free-call pass cannot reach another function
+ *   through it either (`localOnlyCallees` refuses the name guess).
+ */
+function emitLuaTablePathEdges(
   graph: KnowledgeGraph,
   scopes: ScopeResolutionIndexes,
   parsedFiles: readonly ParsedFile[],
   nodeLookup: GraphNodeLookup,
   handledSites: Set<string>,
-  _model: SemanticModel,
 ): number {
-  const parsedFilesByPath = new Map(parsedFiles.map((file) => [file.filePath, file]));
   const seen = new Set<string>();
   let emitted = 0;
-
   for (const parsed of parsedFiles) {
     for (const site of parsed.referenceSites) {
-      if (site.kind !== 'call' || site.explicitReceiver !== undefined) continue;
+      if (site.kind !== 'call') continue;
+      if (site.explicitReceiver === undefined && site.rawQualifiedName?.includes('.') !== true) {
+        continue;
+      }
       const siteKey = `${parsed.filePath}:${site.atRange.startLine}:${site.atRange.startCol}`;
       if (handledSites.has(siteKey)) continue;
-
-      const channel = parsed.captureSideChannel as LuaCaptureSideChannel | undefined;
-      if (channel?.callableAliases.some((alias) => alias.destination === site.name) !== true)
-        continue;
-      const target = resolveLuaCallableAlias(parsed, site.name, scopes, parsedFilesByPath);
-      if (target === undefined || target === 'ambiguous') continue;
-
-      if (tryEmitEdge(graph, scopes, nodeLookup, site, target, 'lua-callable-alias', seen, 0.85)) {
+      handledSites.add(siteKey);
+      const target = resolveLuaPathSite(parsed.filePath, site.rawQualifiedName, scopes);
+      if (
+        target !== undefined &&
+        tryEmitEdge(graph, scopes, nodeLookup, site, target, 'lua-table-path', seen, 0.85)
+      ) {
         emitted++;
       }
-      handledSites.add(siteKey);
     }
   }
   return emitted;
@@ -264,6 +215,7 @@ const luaScopeResolver: ScopeResolver = {
   // this clear-all is the belt-and-suspenders lifecycle hook.
   loadResolutionConfig: () => {
     clearLuaHeritageFacts();
+    luaPathIndex = undefined;
     return undefined;
   },
 
@@ -310,6 +262,9 @@ const luaScopeResolver: ScopeResolver = {
     buildMro(graph, parsedFiles, nodeLookup, defaultLinearize),
 
   populateOwners: populateLuaOwners,
+  populateWorkspaceOwners: (parsedFiles) => {
+    luaPathIndex = buildLuaPathIndex(parsedFiles);
+  },
 
   // middleclass exposes the parent class as `Class.__base`; the qualified
   // receiver hook below resolves `Class.__base.method()` through the generic
@@ -334,11 +289,19 @@ const luaScopeResolver: ScopeResolver = {
   isGlobalNameFallbackPlausible: ({ callerParsed, candidate, site }) =>
     candidate.isExported !== false && !localOnlyCalleesOf(callerParsed).has(site.name),
 
-  // Module-level aliases such as `local f = util.answer; f()` are not
-  // receiver calls, so the generic receiver pass cannot see their target.
-  // Resolve only static, uniquely identified aliases here; dynamic keys,
-  // factory results, function-local aliases, cycles, and ambiguity fail closed.
-  emitUnresolvedReceiverEdges: emitLuaCallableAliasEdges,
+  // A bare call to a Lua global (`foo()` with no visible `local foo`) is a
+  // lookup in the one global table: resolve it through the workspace path
+  // index — only true global functions are keyed there — before the scope
+  // chain. Member-path keys are `emitLuaTablePathEdges`' and local-function
+  // keys (`@line:col`) the scope chain's, so each site has one resolver.
+  resolveQualifiedFreeCall: (site, callerParsed, scopes) => {
+    const key = site.rawQualifiedName;
+    return key === undefined || key.includes('.') || key.startsWith('@')
+      ? undefined
+      : resolveLuaPathSite(callerParsed.filePath, key, scopes);
+  },
+
+  emitUnresolvedReceiverEdges: emitLuaTablePathEdges,
 };
 
 export { luaScopeResolver };

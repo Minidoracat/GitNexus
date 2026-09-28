@@ -9,6 +9,8 @@
  * `emitScopeCaptures` populates this map as a side effect, then
  * `LanguageProvider.collectCaptureSideChannel` snapshots it per file.
  */
+import type { LuaDefKeys } from './path-env.js';
+
 export interface LuaExtendsPair {
   /** Child class name (quotes stripped from the `class("Name", ...)` string arg). */
   readonly child: string;
@@ -31,11 +33,6 @@ export interface LuaReturnedField {
   readonly localName: string;
 }
 
-export interface LuaCallableAlias {
-  readonly destination: string;
-  readonly source: string;
-}
-
 export interface LuaCaptureSideChannel {
   readonly kind: 'lua';
   readonly extendsPairs: readonly LuaExtendsPair[];
@@ -44,8 +41,16 @@ export interface LuaCaptureSideChannel {
   readonly returnedNames: readonly string[];
   /** Static fields returned from a table literal, e.g. `{ Animal = Animal }`. */
   readonly returnedFields: readonly LuaReturnedField[];
-  /** Module-level static callable aliases, e.g. `local f = util.answer`. */
-  readonly callableAliases: readonly LuaCallableAlias[];
+  /**
+   * Table-path keys every table member / global function def is reachable
+   * under (`MyMod.Client.Tx.create`, `#1.create`; encoding in `path-env.ts`),
+   * by def anchor. The resolver indexes these workspace-wide.
+   */
+  readonly defKeys: readonly LuaDefKeys[];
+  /** Keys of the table the chunk's `return` exposes (`return P`). */
+  readonly returnKeys: readonly string[];
+  /** Keys per field when the chunk returns a table constructor (`return { f = f }`). */
+  readonly returnFieldKeys: Readonly<Record<string, readonly string[]>>;
   /**
    * Names whose every bare call in this file resolves to a lexical `local`
    * (see `path-env.ts`). A workspace-wide name guess for such a call is

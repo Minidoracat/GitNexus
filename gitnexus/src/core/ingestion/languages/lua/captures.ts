@@ -29,12 +29,17 @@ import {
   type LuaExtendsPair,
   type LuaMethodOwnerPair,
   type LuaReturnedField,
-  type LuaCallableAlias,
 } from './capture-side-channel.js';
 import { getTreeSitterBufferSize } from '../../constants.js';
 import { parseSourceSafe } from '../../../tree-sitter/safe-parse.js';
 import { synthesizeCallableFlowCaptures } from '../../utils/callable-flow-captures.js';
-import { collectLuaLexicalFacts, simpleVariableName, type LuaLexicalFacts } from './path-env.js';
+import {
+  collectLuaPathFacts,
+  isLuaRequireCall,
+  isNestedInLuaFunction,
+  simpleVariableName,
+  type LuaLexicalFacts,
+} from './path-env.js';
 
 const LUA_CALLABLE_CAPTURE_OPTIONS = {
   functionNodeTypes: new Set([
@@ -81,12 +86,6 @@ function stripQuotes(s: string): string {
   return s.replace(/^["']|["']$/g, '');
 }
 
-function isRequireCall(node: Parser.SyntaxNode): boolean {
-  if (node.type !== 'call') return false;
-  const fn = node.childForFieldName('function');
-  return fn?.type === 'variable' && fn.childForFieldName('name')?.text === 'require';
-}
-
 function requireStringNode(call: Parser.SyntaxNode): Parser.SyntaxNode | undefined {
   const args = call.childForFieldName('arguments');
   if (args === null) return undefined;
@@ -129,7 +128,7 @@ function collectLuaImportCaptures(root: Parser.SyntaxNode): readonly CaptureMatc
       // Pair by source position. Never reuse an RHS for multiple LHS names.
       for (let i = 0; i < Math.min(names.length, expressions.length); i++) {
         const expression = expressions[i];
-        if (!isRequireCall(expression)) continue;
+        if (!isLuaRequireCall(expression)) continue;
         const source = requireStringNode(expression);
         if (source !== undefined) out.push(importCapture(node, source, names[i]));
       }
@@ -140,7 +139,7 @@ function collectLuaImportCaptures(root: Parser.SyntaxNode): readonly CaptureMatc
       // need their own IMPORTS edge.
       const directRequires = new Set<Parser.SyntaxNode>();
       for (const expression of expressions) {
-        if (isRequireCall(expression) && requireStringNode(expression) !== undefined) {
+        if (isLuaRequireCall(expression) && requireStringNode(expression) !== undefined) {
           directRequires.add(expression);
         }
       }
@@ -148,7 +147,7 @@ function collectLuaImportCaptures(root: Parser.SyntaxNode): readonly CaptureMatc
       return;
     }
 
-    if (isRequireCall(node)) {
+    if (isLuaRequireCall(node)) {
       if (suppressed.has(node)) {
         for (const child of node.namedChildren) visit(child, suppressed);
         return;
@@ -348,70 +347,6 @@ function markLuaTableMember(
   match['@declaration.is-exported'] = syntheticCapture('@declaration.is-exported', nameNode, 'false');
 }
 
-function isNestedInLuaFunction(node: Parser.SyntaxNode): boolean {
-  for (let enclosing = node.parent; enclosing !== null; enclosing = enclosing.parent) {
-    if (
-      enclosing.type === 'function_definition_statement' ||
-      enclosing.type === 'local_function_definition_statement' ||
-      enclosing.type === 'function_definition'
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function collectLuaCallableAliases(root: Parser.SyntaxNode): readonly LuaCallableAlias[] {
-  const aliases: LuaCallableAlias[] = [];
-  const visit = (node: Parser.SyntaxNode, inFunction: boolean): void => {
-    const nextInFunction =
-      inFunction ||
-      node.type === 'function_definition_statement' ||
-      node.type === 'local_function_definition_statement' ||
-      node.type === 'function_definition';
-    if (
-      !nextInFunction &&
-      (node.type === 'local_variable_declaration' || node.type === 'variable_assignment')
-    ) {
-      const destinations =
-        node.namedChildren.find((child) => child.type === 'variable_list')?.namedChildren ?? [];
-      const sources =
-        node.namedChildren.find((child) => child.type === 'expression_list')?.namedChildren ?? [];
-      for (let index = 0; index < Math.min(destinations.length, sources.length); index++) {
-        const destination = destinations[index];
-        const source = sources[index];
-        const destinationName =
-          destination?.type === 'variable' &&
-          destination.childForFieldName('name')?.type === 'identifier' &&
-          destination.childForFieldName('table') === null &&
-          destination.childForFieldName('field') === null
-            ? destination.childForFieldName('name')?.text
-            : undefined;
-        const sourceIsStaticMember =
-          source?.type === 'variable' &&
-          source.childForFieldName('table')?.type === 'identifier' &&
-          (source.childForFieldName('field')?.type === 'identifier' ||
-            source.childForFieldName('method')?.type === 'identifier');
-        const sourceIsSimple =
-          source?.type === 'variable' &&
-          source.childForFieldName('name')?.type === 'identifier' &&
-          source.childForFieldName('table') === null &&
-          source.childForFieldName('field') === null;
-        if (
-          destinationName !== undefined &&
-          source !== undefined &&
-          (sourceIsStaticMember || sourceIsSimple)
-        ) {
-          aliases.push({ destination: destinationName, source: source.text });
-        }
-      }
-    }
-    for (const child of node.namedChildren) visit(child, nextInFunction);
-  };
-  visit(root, false);
-  return aliases;
-}
-
 function addLuaArityCaptures(
   match: Record<string, Capture>,
   functionNode: Parser.SyntaxNode,
@@ -454,7 +389,7 @@ export function emitLuaScopeCaptures(
     });
   }
 
-  const lexical = collectLuaLexicalFacts(tree.rootNode);
+  const facts = collectLuaPathFacts(tree.rootNode);
   const out: CaptureMatch[] = [];
   for (const match of getLuaScopeQuery().matches(tree.rootNode)) {
     const grouped: Record<string, Capture> = {};
@@ -475,6 +410,23 @@ export function emitLuaScopeCaptures(
         grouped['@declaration.name'] = { ...nameCap, text: stripped };
       }
     }
+    // The path the callee names (`MyMod.Client.Tx.create`, a local alias's
+    // target, …) rides on the site as its qualified name; the resolver maps it
+    // through the workspace path index (see `path-env.ts` for the encoding).
+    const callNode = match.captures.find((capture) =>
+      capture.name.startsWith('reference.call.'),
+    )?.node;
+    const callKey =
+      callNode === undefined
+        ? undefined
+        : facts.callKeys.get(`${callNode.startIndex}:${callNode.endIndex}`);
+    if (callNode !== undefined && callKey !== undefined) {
+      grouped['@reference.qualified-name'] = syntheticCapture(
+        '@reference.qualified-name',
+        callNode.childForFieldName('function') ?? callNode,
+        callKey,
+      );
+    }
     const declarationNode = match.captures.find(
       (capture) => capture.name === 'declaration.function' || capture.name === 'declaration.method',
     )?.node;
@@ -491,7 +443,7 @@ export function emitLuaScopeCaptures(
         // `f` resolves to at that point — a forward-declared local or a global.
         const exported =
           declarationNode.type === 'function_definition_statement' &&
-          !lexical.localIdentifierStarts.has(declarationName.startIndex);
+          !facts.localIdentifierStarts.has(declarationName.startIndex);
         grouped['@declaration.is-exported'] = syntheticCapture(
           '@declaration.is-exported',
           declarationName,
@@ -508,7 +460,7 @@ export function emitLuaScopeCaptures(
   // the AST lists preserve positional local/RHS pairing and support all Lua
   // string-call forms without producing a cross-product of captures.
   out.push(...collectLuaImportCaptures(tree.rootNode));
-  out.push(...collectLuaAssignedFunctionCaptures(tree.rootNode, lexical));
+  out.push(...collectLuaAssignedFunctionCaptures(tree.rootNode, facts));
   out.push(...synthesizeCallableFlowCaptures(tree.rootNode, LUA_CALLABLE_CAPTURE_OPTIONS));
 
   // Heritage pairs (middleclass EXTENDS + HAS_METHOD) — collected here in the
@@ -554,15 +506,16 @@ export function emitLuaScopeCaptures(
     classNames.has(name),
   );
   const returnedFields = collectLuaReturnedFields(tree.rootNode);
-  const callableAliases = collectLuaCallableAliases(tree.rootNode);
-  const { localOnlyCallees } = lexical;
+  const { localOnlyCallees, defKeys, returnKeys, returnFields: returnFieldKeys } = facts;
   if (
     extendsPairs.length > 0 ||
     methodOwners.length > 0 ||
     returnedNames.length > 0 ||
     returnedFields.length > 0 ||
-    callableAliases.length > 0 ||
-    localOnlyCallees.length > 0
+    localOnlyCallees.length > 0 ||
+    defKeys.length > 0 ||
+    returnKeys.length > 0 ||
+    Object.keys(returnFieldKeys).length > 0
   ) {
     setLuaHeritageFacts(filePath, {
       kind: 'lua',
@@ -570,8 +523,10 @@ export function emitLuaScopeCaptures(
       methodOwners,
       returnedNames,
       returnedFields,
-      callableAliases,
       localOnlyCallees,
+      defKeys,
+      returnKeys,
+      returnFieldKeys,
     });
   } else {
     // Re-capture produced no heritage — drop any prior facts for this file so

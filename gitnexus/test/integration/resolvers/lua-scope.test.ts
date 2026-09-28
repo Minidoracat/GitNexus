@@ -378,11 +378,13 @@ answer()
 `,
       });
       const result = await runPipelineFromRepo(tmpDir, () => {});
+      // Exactly one edge — the require-rooted path `~util.answer` is resolved
+      // once, by the table-path pass, not again by a name guess.
       expect(
-        getRelationships(result, 'CALLS').some(
-          (edge) => edge.sourceFilePath?.endsWith('main.lua') && edge.target === 'answer',
-        ),
-      ).toBe(true);
+        getRelationships(result, 'CALLS')
+          .filter((edge) => edge.sourceFilePath?.endsWith('main.lua') && edge.target === 'answer')
+          .map((edge) => `${path.basename(edge.targetFilePath)} ${edge.rel.reason}`),
+      ).toEqual(['util.lua lua-table-path']);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -880,15 +882,11 @@ second()
 `,
       });
       const result = await runPipelineFromRepo(tmpDir, () => {});
-      const calls = getRelationships(result, 'CALLS');
       expect(
-        calls.some(
-          (edge) =>
-            edge.sourceFilePath?.endsWith('main.lua') &&
-            edge.target === 'answer' &&
-            edge.targetFilePath?.endsWith('util.lua'),
-        ),
-      ).toBe(true);
+        getRelationships(result, 'CALLS')
+          .filter((edge) => edge.sourceFilePath?.endsWith('main.lua') && edge.target === 'answer')
+          .map((edge) => `${path.basename(edge.targetFilePath)} ${edge.rel.reason}`),
+      ).toEqual(['util.lua lua-table-path']);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -1071,7 +1069,7 @@ function render() return getText("UI_Title") end
     );
   }, 60000);
 
-  it('does not route a local alias call to a same-named member of another table', async () => {
+  it('routes a local alias call to the aliased table member, not a same-named one', async () => {
     await withLuaFixture(
       {
         'm/media/lua/shared/core.lua': `MyMod = MyMod or {}
@@ -1091,6 +1089,7 @@ function draw(e) return itemName(e) end
       },
       (result) => {
         expect(callsBetween(result, 'draw', 'itemName')).toEqual([]);
+        expect(callsBetween(result, 'draw', 'itemLabel')).toEqual(['draw -> itemLabel@core.lua']);
       },
     );
   }, 60000);
@@ -1114,6 +1113,7 @@ function laneOk(x) return isFinite(x) end
           'profileOk -> isFinite@profile.lua',
         ]);
         expect(callsBetween(result, 'laneOk', 'isFinite')).toEqual([]);
+        expect(callsBetween(result, 'laneOk', 'finite')).toEqual(['laneOk -> finite@dyn.lua']);
       },
     );
   }, 60000);
@@ -1173,6 +1173,139 @@ function poiRefresh() return getBoolOption("B", false) end
       },
       (result) => {
         expect(callsBetween(result, 'use', 'cb')).toEqual([]);
+      },
+    );
+  }, 60000);
+});
+
+// ---------------------------------------------------------------------------
+// Global module tables: `MyMod = MyMod or {}`, local aliases (`local C =
+// MyMod.Client`) and local tables registered under a global path
+// (`C.Tx = P`) resolve member calls across files with no `require` binding.
+// ---------------------------------------------------------------------------
+
+describe('Lua scope: global table paths', () => {
+  it('resolves a direct global-table member call across files', async () => {
+    await withLuaFixture(
+      {
+        'm/media/lua/shared/f.lua': `MDADFollower = MDADFollower or {}
+function MDADFollower.laneBiasAt(p) return p end
+`,
+        'm/media/lua/shared/d.lua': 'function drive(p) return MDADFollower.laneBiasAt(p) end\n',
+      },
+      (result) => {
+        expect(callsBetween(result, 'drive', 'laneBiasAt')).toEqual(['drive -> laneBiasAt@f.lua']);
+      },
+    );
+  }, 60000);
+
+  it('follows local alias chains and a local table registered under a global path', async () => {
+    await withLuaFixture(
+      {
+        'm/media/lua/shared/core.lua': `MinidoracatEconomy = MinidoracatEconomy or {}
+local EC = MinidoracatEconomy
+function EC.sortSafe(l) return l end
+`,
+        'm/media/lua/client/client.lua': `local EC = MinidoracatEconomy
+EC.Client = EC.Client or {}
+`,
+        'm/media/lua/client/tx.lua': `local EC = MinidoracatEconomy
+local C = EC.Client
+local P = {}
+C.AdminTransactions = P
+function P.create(o) return o end
+return P
+`,
+        'm/media/lua/client/admin.lua': `local EC = MinidoracatEconomy
+local C = EC.Client
+local Transactions = C.AdminTransactions
+local Panel = {}
+function Panel:build()
+  EC.sortSafe({})
+  return Transactions.create(self)
+end
+`,
+      },
+      (result) => {
+        expect(callsBetween(result, 'build', 'create')).toEqual(['build -> create@tx.lua']);
+        expect(callsBetween(result, 'build', 'sortSafe')).toEqual(['build -> sortSafe@core.lua']);
+      },
+    );
+  }, 60000);
+
+  it('resolves calls on an unregistered local table and through self in its methods', async () => {
+    await withLuaFixture(
+      {
+        'm.lua': `local P = {}
+function P.a() end
+function P.b() P.a() end
+function P:c() self:b() end
+return P
+`,
+      },
+      (result) => {
+        expect(callsBetween(result, 'b', 'a')).toEqual(['b -> a@m.lua']);
+        expect(callsBetween(result, 'c', 'b')).toEqual(['c -> b@m.lua']);
+      },
+    );
+  }, 60000);
+
+  it('refuses a path that two files define', async () => {
+    await withLuaFixture(
+      {
+        'a.lua': 'M = M or {}\nfunction M.f() end\n',
+        'b.lua': 'M = M or {}\nfunction M.f() end\n',
+        'c.lua': 'function g() M.f() end\n',
+      },
+      (result) => {
+        expect(callsBetween(result, 'g', 'f')).toEqual([]);
+      },
+    );
+  }, 60000);
+
+  it('refuses a reassigned alias, a parameter shadowing the table, and a computed key', async () => {
+    await withLuaFixture(
+      {
+        'lib.lua': 'Lib = Lib or {}\nfunction Lib.a() end\nfunction Lib.b() end\n',
+        'main.lua': `local f = Lib.a
+f = Lib.b
+function u1() f() end
+function u2(Lib) Lib.a() end
+function u3(k) Lib[k]() end
+`,
+      },
+      (result) => {
+        for (const caller of ['u1', 'u2', 'u3']) {
+          expect(callsBetween(result, caller, 'a')).toEqual([]);
+          expect(callsBetween(result, caller, 'b')).toEqual([]);
+        }
+      },
+    );
+  }, 60000);
+
+  it('does not turn a monkey-patch wrapper into a self-call', async () => {
+    await withLuaFixture(
+      {
+        'p.lua': `local orig = ISFoo.bar
+function ISFoo.bar(self, ...) return orig(self, ...) end
+`,
+        'q.lua': 'function use() ISFoo.bar(1) end\n',
+      },
+      (result) => {
+        expect(callsBetween(result, 'bar', 'bar')).toEqual([]);
+        expect(callsBetween(result, 'use', 'bar')).toEqual(['use -> bar@p.lua']);
+      },
+    );
+  }, 60000);
+
+  it('does not index a member defined only when a function runs', async () => {
+    await withLuaFixture(
+      {
+        'm.lua': 'M = M or {}\nfunction init() M.late = function() end end\n',
+        'n.lua': 'function g() M.late() end\n',
+      },
+      (result) => {
+        expect(callsBetween(result, 'g', 'late')).toEqual([]);
       },
     );
   }, 60000);
