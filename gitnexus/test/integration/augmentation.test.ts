@@ -109,6 +109,13 @@ withTestLbugDB(
         expect(typeof result).toBe('string');
       });
 
+      it('matches each identifier of a regex pattern, not the raw pattern text', async () => {
+        // Hooks forward the agent's grep regex verbatim: an alternation whose
+        // only real symbol is the second branch, wrapped in \b word boundaries.
+        const result = await augment('nonexistent_xyz|\\bhash\\b', handle.dbPath);
+        expect(result).toContain('hash (src/utils.ts)');
+      });
+
       it('handles very long pattern without throwing', async () => {
         const result = await augment('a'.repeat(500), handle.dbPath);
         expect(typeof result).toBe('string');
