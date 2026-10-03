@@ -16,6 +16,7 @@
  */
 
 import fs from 'fs/promises';
+import path from 'path';
 import lbug from '@ladybugdb/core';
 import { isReadOnlyDbError, loadFTSExtension, loadVectorExtension } from './lbug-adapter.js';
 import { closeQueryResults } from './query-result-utils.js';
@@ -38,6 +39,7 @@ import {
   renameFailureMessage,
   statIfExists,
 } from './sidecar-recovery.js';
+import { isIndexLockHeld } from '../../storage/index-lock.js';
 
 /** Per-repo pool: one Database, many Connections */
 interface PoolEntry {
@@ -828,6 +830,17 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<InitLbugAttem
     }
   }
   if (!shared) {
+    // A live analyze owns this index until it finishes; on Windows it rewrites
+    // the files in place. Opening now reads a half-built graph, and the recovery
+    // paths below take the writer's fresh WAL for a crashed run's orphan and
+    // quarantine it — failing the writer's next checkpoint, so FTS is left
+    // unbuilt. Wait the writer out on the same retry as a lock conflict.
+    if (await isIndexLockHeld(path.dirname(dbPath))) {
+      return {
+        status: 'retry',
+        error: new Error('a running `gitnexus analyze` holds the index write lock'),
+      };
+    }
     // Open in read-only mode — MCP server never writes to the database.
     // This allows multiple MCP server instances to read concurrently, and
     // avoids lock conflicts when `gitnexus analyze` is writing. This attempt

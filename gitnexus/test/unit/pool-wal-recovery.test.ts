@@ -5,6 +5,7 @@
  * without needing a real LadybugDB instance or corrupted WAL file.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type * as IndexLockModule from '../../src/storage/index-lock.js';
 
 const { connectionQueryMock, stderrWriteMock } = vi.hoisted(() => ({
   connectionQueryMock: vi.fn(),
@@ -57,8 +58,14 @@ vi.mock('../../src/mcp/stdio-capture.js', () => ({
   getActiveStdoutWrite: vi.fn(() => vi.fn()),
 }));
 
+vi.mock('../../src/storage/index-lock.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof IndexLockModule>()),
+  isIndexLockHeld: vi.fn().mockResolvedValue(false),
+}));
+
 import fs from 'fs/promises';
 import { createLbugDatabase } from '../../src/core/lbug/lbug-config.js';
+import { isIndexLockHeld } from '../../src/storage/index-lock.js';
 
 const { closeLbug } = await import('../../src/core/lbug/pool-adapter.js');
 
@@ -265,6 +272,23 @@ describe('WAL corruption recovery in doInitLbug (#1402)', () => {
       setTimeoutSpy.mockRestore();
     }
 
+    expect(fs.rename).not.toHaveBeenCalled();
+  });
+
+  it('neither opens nor quarantines while a live analyze holds the index lock', async () => {
+    // On Windows analyze rewrites the index in place; its fresh WAL looks like a
+    // tiny orphan, and quarantining it failed the writer's checkpoint (FTS unbuilt).
+    const { initLbug } = await import('../../src/core/lbug/pool-adapter.js');
+    vi.mocked(isIndexLockHeld).mockResolvedValue(true);
+    try {
+      await expect(initLbug('test-repo-writer-live', '/tmp/test-writer-live/lbug')).rejects.toThrow(
+        /running `gitnexus analyze` holds the index write lock/,
+      );
+    } finally {
+      vi.mocked(isIndexLockHeld).mockResolvedValue(false);
+    }
+    expect(isIndexLockHeld).toHaveBeenCalledWith('/tmp/test-writer-live');
+    expect(createLbugDatabase).not.toHaveBeenCalled();
     expect(fs.rename).not.toHaveBeenCalled();
   });
 

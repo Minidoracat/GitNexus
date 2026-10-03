@@ -8,7 +8,9 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import path from 'path';
+import type * as IndexLockModule from '../../src/storage/index-lock.js';
 import { withTestLbugDB } from '../helpers/test-indexed-db.js';
+import { isIndexLockHeld } from '../../src/storage/index-lock.js';
 
 // ─── Seed data & FTS indexes for augmentation ────────
 
@@ -67,6 +69,11 @@ vi.mock('../../src/storage/storage-resolver.js', async (importOriginal) => {
   };
 });
 
+vi.mock('../../src/storage/index-lock.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof IndexLockModule>()),
+  isIndexLockHeld: vi.fn().mockResolvedValue(false),
+}));
+
 let augment: (pattern: string, cwd?: string) => Promise<string>;
 let augmentNoFts: (pattern: string, cwd?: string) => Promise<string>;
 
@@ -114,6 +121,12 @@ withTestLbugDB(
         // only real symbol is the second branch, wrapped in \b word boundaries.
         const result = await augment('nonexistent_xyz|\\bhash\\b', handle.dbPath);
         expect(result).toContain('hash (src/utils.ts)');
+      });
+
+      it('skips augmentation while a running analyze holds the index lock', async () => {
+        // The read pool would wait the writer out for ~6s — past the hook budget.
+        vi.mocked(isIndexLockHeld).mockResolvedValueOnce(true);
+        expect(await augment('login', handle.dbPath)).toBe('');
       });
 
       it('handles very long pattern without throwing', async () => {

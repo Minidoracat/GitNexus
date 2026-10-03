@@ -879,6 +879,39 @@ const selectBackend = (): 'socket' | 'file' => {
   return process.platform === 'win32' || process.platform === 'linux' ? 'socket' : 'file';
 };
 
+/** Upper bound on {@link isIndexLockHeld}'s socket probe; a live holder answers at once. */
+const HOLD_PROBE_TIMEOUT_MS = 200;
+
+/**
+ * Whether a live writer holds the index lock for `lockDir` — asked without
+ * taking it. Readers check before touching LadybugDB sidecars: on the in-place
+ * write path (Windows) the writer's fresh WAL looks exactly like a crashed run's
+ * tiny orphan, and quarantining it fails the writer's next checkpoint rename,
+ * leaving FTS unbuilt.
+ */
+export const isIndexLockHeld = async (lockDir: string): Promise<boolean> => {
+  if (selectBackend() === 'socket') {
+    const held = await new Promise<boolean>((resolve) => {
+      const socket = net.connect(socketLockName(lockDir));
+      const settle = (value: boolean): void => {
+        socket.destroy();
+        resolve(value);
+      };
+      socket.once('connect', () => settle(true));
+      socket.once('error', () => settle(false));
+      socket.setTimeout(HOLD_PROBE_TIMEOUT_MS, () => settle(false));
+    });
+    if (held) return true;
+  }
+  // A writer whose socket backend was unavailable (or on macOS/BSD) holds a pidfile.
+  try {
+    const holder = readRecord(path.join(lockDir, LOCK_FILENAME));
+    return holder !== null && holder.hostname === os.hostname() && isProcessAlive(holder.pid);
+  } catch {
+    return false;
+  }
+};
+
 /**
  * Acquire the exclusive write lock for `lockDir` (the resolved index slot
  * directory). Uses the OS socket/pipe backend where available (Windows/Linux),

@@ -22,6 +22,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   acquireIndexLock,
+  isIndexLockHeld,
   sweepStagingArtifacts,
   isLockUnwritableCode,
   IndexLockTimeoutError,
@@ -175,6 +176,16 @@ describe('release', () => {
     lock.release();
     expect(() => lock.release()).not.toThrow();
   });
+
+  it('reports a live file-backend holder to readers, and nothing once released', async () => {
+    const lock = await acquireIndexLock(dir);
+    expect(await isIndexLockHeld(dir)).toBe(true);
+    lock.release();
+    expect(await isIndexLockHeld(dir)).toBe(false);
+    // A dead pid's leftover record is not a live writer.
+    seedLock({ pid: 999999999, token: 'dead-holder' });
+    expect(await isIndexLockHeld(dir)).toBe(false);
+  });
 });
 
 describe('sweepStagingArtifacts', () => {
@@ -303,6 +314,17 @@ describe.skipIf(process.platform !== 'linux' && process.platform !== 'win32')(
       // Once released, the endpoint is free again.
       const second = await acquireIndexLock(dir, { timeoutMs: 2000 });
       second.release();
+    });
+
+    it('lets a reader see a live holder without taking the lock', async () => {
+      const lock = await acquireIndexLock(dir, { timeoutMs: 2000 });
+      expect(await isIndexLockHeld(dir)).toBe(true);
+      // The probe must not have displaced the holder.
+      await expect(acquireIndexLock(dir, { timeoutMs: 300, pollMs: 20 })).rejects.toBeInstanceOf(
+        IndexLockTimeoutError,
+      );
+      lock.release();
+      expect(await isIndexLockHeld(dir)).toBe(false);
     });
 
     it('reports the holder as unknown on timeout — never a bogus "pid -1" (#2658 review M3)', async () => {

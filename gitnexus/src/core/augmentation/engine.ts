@@ -23,6 +23,7 @@ import {
 import { LBUG_DIRECTORY } from '../../storage/storage-constants.js';
 import { BRANCHES_DIR, branchSlug } from '../../storage/branch-index.js';
 import { getCurrentBranch } from '../../storage/git.js';
+import { isIndexLockHeld } from '../../storage/index-lock.js';
 import { escapeCypherString } from '../lbug/cypher-escape.js';
 
 /**
@@ -135,6 +136,9 @@ export async function augment(pattern: string, cwd?: string): Promise<string> {
   try {
     const repo = await findRepoForCwd(workDir);
     if (!repo) return '';
+    // A running analyze owns the index: the read pool would wait it out (~6s),
+    // far past augment's budget, so skip — augment is optional context.
+    if (await isIndexLockHeld(path.dirname(repo.lbugPath))) return '';
 
     // Lazy-load lbug adapter (skip unnecessary init)
     const { initLbug, executeQuery, isLbugReady } = await import('../lbug/pool-adapter.js');

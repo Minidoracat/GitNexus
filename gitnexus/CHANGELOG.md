@@ -12,6 +12,7 @@ All notable changes to GitNexus will be documented in this file.
 ### Fixed
 
 - **`augment` matches the identifiers inside a regex search pattern** — hooks forward the agent's raw grep/rg pattern (`foo|bar`, `\bfoo\b`, `Foo\.bar\(`), which was compared whole against symbol names and almost never matched. augment now drops letter escapes, extracts up to 8 identifiers (3+ characters, in pattern order), runs BM25 on them and accepts a symbol whose name contains any of them, ranking exact name matches first; a pattern with no identifier returns before opening the database. Replaying 390 real agent grep patterns from Lua/Java repositories raised the hit rate from 4% to 46%
+- **Read pool waits out a running analyze instead of "recovering" its sidecars** — on Windows analyze rewrites the index in place, and an MCP or `augment` reader opening mid-write took the writer's fresh `lbug.wal` for a crashed run's orphan and quarantined it; the writer's next checkpoint rename then failed (`lbug.wal` → `lbug.wal.checkpoint`: file not found) and FTS was left unbuilt until a `--force` rebuild. The pool now probes the index write lock (`isIndexLockHeld`, socket or pidfile backend, without taking it) and, while it is held, retries like a lock conflict and ends in the existing "another process may be rebuilding the index" error — no native open, no quarantine, no writable shadow replay
 
 ## [1.6.12] - 2026-09-12
 
