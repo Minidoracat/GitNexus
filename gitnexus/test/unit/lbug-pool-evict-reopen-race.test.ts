@@ -69,6 +69,14 @@ vi.mock('../../src/core/lbug/sidecar-recovery.js', () => ({
     .mockResolvedValue({ moved: [], removed: [], failed: [] }),
   renameFailureMessage: vi.fn((p: string) => `rename failed for ${p}`),
   statIfExists: vi.fn().mockResolvedValue(null),
+  assertReadOnlyFtsCrashSafe: vi.fn().mockResolvedValue(undefined),
+  FtsReaderUnrepairableError: class FtsReaderUnrepairableError extends Error {
+    readonly code = 'FTS_READER_UNREPAIRABLE' as const;
+    constructor(dbPath = '') {
+      super(dbPath);
+      this.name = 'FtsReaderUnrepairableError';
+    }
+  },
 }));
 
 const { initLbug, closeLbug, isLbugReady, unpinRepo } =
@@ -114,6 +122,8 @@ describe('pool-adapter evict-then-reopen race (fire-and-forget close fix)', () =
 
     vi.mocked(createLbugDatabase).mockImplementationOnce(() => ({
       init: vi.fn().mockResolvedValue(undefined),
+      initSync: vi.fn(),
+      closeSync: vi.fn(),
       close: vi.fn().mockImplementation(async () => {
         await new Promise((resolve) => setTimeout(resolve, 20));
         order.push('repo1-close-end');
@@ -147,6 +157,8 @@ describe('pool-adapter evict-then-reopen race (fire-and-forget close fix)', () =
 
     vi.mocked(createLbugDatabase).mockImplementationOnce(() => ({
       init: vi.fn().mockResolvedValue(undefined),
+      initSync: vi.fn(),
+      closeSync: vi.fn(),
       close: vi.fn().mockImplementation(async () => {
         await new Promise((resolve) => setTimeout(resolve, 20));
         order.push('close-end');

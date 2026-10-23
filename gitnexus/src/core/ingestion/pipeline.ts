@@ -224,6 +224,10 @@ export interface PipelineOptions {
    * call sites.
    */
   workerUrlForTest?: URL;
+  /** Worker entry selected while capturing parser identity, reused by the pool. */
+  parseWorkerUrl?: URL;
+  /** Run-owned transient ParsedFiles, also used when persistent caches are disabled. */
+  parsedFileStorePath?: string;
   /**
    * Incremental-indexing parse cache. When provided:
    *   - The parse phase looks up each chunk's content hash in
@@ -250,6 +254,15 @@ export interface PipelineOptions {
    * analyze invocations.
    */
   workerPoolSize?: number;
+  /**
+   * Process-detection budget (#3313). Explicit `maxProcesses` replaces the
+   * dynamic `symbols / 10` formula; the other three replace compiled defaults.
+   * Unset fields keep shipped behavior. `0` is rejected upstream — not unlimited.
+   */
+  maxProcesses?: number;
+  maxProcessBranching?: number;
+  maxProcessTraceDepth?: number;
+  maxEntryPointCandidates?: number;
   /**
    * Number of chunks whose file contents may be read into memory in
    * parallel while the worker pool is busy dispatching the current
@@ -443,8 +456,8 @@ export const runPipelineFromRepo = async (
   const propertyInference = scopeResolutionOutput.propertyInference;
 
   // Presence check, not `!skipGraphPhases`: phases can now be filtered out by
-  // any `enabledWhen` predicate (streamGraphEmit disables communities/processes
-  // too), and `getPhaseOutput` THROWS on a phase that was never resolved. Keying
+  // any `enabledWhen` predicate (`skipGraphPhases` drops communities/processes),
+  // and `getPhaseOutput` THROWS on a phase that was never resolved. Keying
   // off the options flag alone made every filtered-out combination crash here
   // rather than return undefined results.
   if (results.has('communities') && results.has('processes')) {

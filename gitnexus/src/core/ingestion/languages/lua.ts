@@ -30,8 +30,6 @@ import { defineLanguage } from '../language-provider.js';
 import { LUA_QUERIES } from '../tree-sitter-queries.js';
 import { typeConfig as luaTypeConfig } from '../type-extractors/lua.js';
 import { luaExportChecker } from '../export-detection.js';
-import { createImportResolver } from '../import-resolvers/resolver-factory.js';
-import { luaImportConfig } from '../import-resolvers/configs/lua.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { luaCallConfig } from '../call-extractors/configs/lua.js';
 import { assertCloneable } from '../workers/clone-safety.js';
@@ -44,7 +42,6 @@ export const luaProvider = defineLanguage({
   treeSitterQueries: LUA_QUERIES,
   typeConfig: luaTypeConfig,
   exportChecker: luaExportChecker,
-  importResolver: createImportResolver(luaImportConfig),
   callExtractor: createCallExtractor(luaCallConfig),
   emitScopeCaptures: emitLuaScopeCaptures,
   collectCaptureSideChannel: (filePath) => assertCloneable(collectLuaCaptureSideChannel(filePath)),

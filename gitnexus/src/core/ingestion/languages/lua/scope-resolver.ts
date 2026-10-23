@@ -20,12 +20,7 @@ import type { KnowledgeGraph } from '../../../graph/types.js';
 import type { GraphNodeLookup } from '../../scope-resolution/graph-bridge/node-lookup.js';
 import { tryEmitEdge } from '../../scope-resolution/graph-bridge/edges.js';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
-import {
-  buildSuffixIndex,
-  LUA_EXTENSIONS,
-  suffixResolve,
-  type SuffixIndex,
-} from '../../import-resolvers/utils.js';
+import { buildSuffixIndex, suffixResolve, type SuffixIndex } from '../../utils/suffix-index.js';
 import type { ScopeResolver } from '../../scope-resolution/contract/scope-resolver.js';
 import { buildMro, defaultLinearize } from '../../scope-resolution/passes/mro.js';
 import { luaProvider } from '../lua.js';
@@ -38,6 +33,9 @@ import {
   resolveLuaPathKey,
   type LuaPathIndex,
 } from './path-index.js';
+
+/** Lua module extensions: `require("a.b")` tries `a/b.lua`, then `a/b/init.lua`. */
+const LUA_EXTENSIONS = ['.lua', '/init.lua'] as const;
 
 // Cache the suffix index across calls within one analyze run — `allFilePaths`
 // is the same ReadonlySet for every Lua import in the run, so keying on its
@@ -241,7 +239,7 @@ const luaScopeResolver: ScopeResolver = {
     // Once the suffix index exists, suffixResolve only consults the index;
     // passing a spread copy here would still traverse the entire workspace on
     // every require() despite the cache (#2909 contract).
-    return suffixResolve(parts, [], [], _cachedIndex ?? undefined, LUA_EXTENSIONS);
+    return suffixResolve(parts, [], [], LUA_EXTENSIONS, _cachedIndex ?? undefined);
   },
 
   // Local-first-then-imports merge, minus table members: `function T.f` is

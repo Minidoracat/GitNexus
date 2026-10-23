@@ -33,6 +33,7 @@ import type { NameFallbackSummary } from '../core/ingestion/scope-resolution/nam
 import type { UndecidedSatisfactionSummary } from '../core/ingestion/scope-resolution/undecided-satisfaction.js';
 import { resolveStoragePath } from './storage-resolver.js';
 import type { ScopeExtractionFailureSummary } from '../core/ingestion/scope-resolution/scope-extraction-failures.js';
+import type { StoredRebuildReason } from '../core/rebuild-reasons.js';
 import { INDEX_METADATA_FILE, LEGACY_METADATA_FILE } from './storage-constants.js';
 
 export { GITNEXUS_DIR, INDEX_METADATA_FILE, LEGACY_METADATA_FILE } from './storage-constants.js';
@@ -41,6 +42,15 @@ export { GITNEXUS_DIR, INDEX_METADATA_FILE, LEGACY_METADATA_FILE } from './stora
 export type ContentRetention = 'full' | 'symbol' | 'none';
 export type FtsProfile = 'full' | 'symbol-no-file-content' | 'name-only';
 export const CONTENT_RETENTION_SCHEMA_VERSION = 1;
+
+/** Exact staged generation whose completed embedding groups can survive a retry. */
+export interface EmbeddingRecoveryReference {
+  /** A run-minted basename within this metadata file's index slot. */
+  stagingFile: string;
+  schemaFingerprint: string;
+  /** Active-window and inherited incomplete groups: never reusable until completed. */
+  unsafeNodeIds: string[];
+}
 
 /**
  * Versioned receipt for the analyzer process that produced an index.
@@ -86,10 +96,28 @@ export interface AnalyzerRunnerIdentity {
   };
 }
 
+/**
+ * Hand-mirrored `FtsSkipReason` from core/search/fts-policy.ts so storage
+ * takes no core import. Change both declarations together.
+ */
+export type PersistedFtsSkipReason =
+  | 'extension-unavailable'
+  | 'build-failed'
+  | 'disabled-by-flag'
+  | 'disabled-by-env'
+  | 'native-abort'
+  | 'tuple-missing';
+
 export interface RepoMeta {
   repoPath: string;
   /** Complete index directory selected for this successful analysis. */
   storagePath?: string;
+  /**
+   * Shared-store checkouts only (#3352): the graph this slot reads when it is
+   * not `<storagePath>/lbug` — a commit graph under the same store. Resolved
+   * and validated by `resolveGraphPath`.
+   */
+  graphPath?: string;
   lastCommit: string;
   indexedAt: string;
   /** Missing on legacy metadata means the upstream-compatible `full` profile. */
@@ -132,6 +160,13 @@ export interface RepoMeta {
    * matches the currently invoked analyzer.
    */
   runnerIdentity?: AnalyzerRunnerIdentity;
+  /** Parser artifacts and extraction options that produced the successful graph.
+   * Missing provenance never authorizes reuse. FTS-only repair preserves it.
+   */
+  parseCacheIdentity?: {
+    base: string;
+    pdg?: { identity: string; maxFunctionLines: number };
+  };
   /**
    * Canonical `origin` remote URL captured at index time. Used to
    * fingerprint the same logical repo across multiple on-disk clones
@@ -184,17 +219,28 @@ export interface RepoMeta {
        *    `--repair-fts` or a content change addresses it.
        *  - `disabled-by-flag` / `disabled-by-env` — deliberate opt-out.
        *    A later analyze without the opt-out rebuilds FTS at the same commit.
+       *  - `native-abort` — inferred on the next run from an FTS-phase dirty
+       *    flag after the previous process died in the native FTS build.
+       *  - `tuple-missing` — no packaged artifact for this platform tuple.
+       *    The tuple itself is not persisted (closed enum; live messages name it).
        *
        * Collapsing both into `status: 'unavailable'` is exactly what made that
        * loop reachable. ABSENT on indexes written before #2841 and on the
        * `--repair-fts` stamp (which writes `status: 'available'`); `undefined`
        * therefore reads as "cause unknown" and keeps the pre-#2841 behaviour.
+       * No schema version: meta reads are unchecked casts. An older binary
+       * still sees the raw JSON string for an unknown member; it does not
+       * drop the field to `undefined` at parse time.
        */
-      skipReason?:
-        | 'extension-unavailable'
-        | 'build-failed'
-        | 'disabled-by-flag'
-        | 'disabled-by-env';
+      skipReason?: PersistedFtsSkipReason;
+      /**
+       * Write plan of the analyze that aborted, persisted with
+       * `skipReason: 'native-abort'` so readers can refuse a leftover live
+       * WAL after recovery clears `incrementalInProgress`. Staging persist
+       * also writes `native-abort` and must keep its live WAL. Absent on
+       * older indexes and on non-abort skips.
+       */
+      writePlan?: 'in-place' | 'staging';
     };
     vectorSearch: {
       provider: string;
@@ -403,8 +449,17 @@ export interface RepoMeta {
     /** Number of files in the writable set, for diagnostic logs.
      *  `0` on the full-rebuild path (no incremental write set exists). */
     toWriteCount: number;
-    /** Last completed writeback phase before the process stopped. */
+    /**
+     * Last completed writeback phase before the process stopped.
+     * `'fts'` is the graph-boundary / FTS-build marker: recovery may act
+     * more narrowly than a bare dirty flag, and `--repair-fts` must not
+     * treat it as a half-written graph.
+     */
     phase?: string;
+    /** Settled write plan at the FTS boundary (in-place vs unpublished staging). */
+    writePlan?: 'in-place' | 'staging';
+    /** Whether the converged graph-boundary CHECKPOINT succeeded. */
+    checkpointSucceeded?: boolean;
     /** Directly changed/added files before importer expansion. */
     directWriteCount?: number;
     /** Extra files pulled into the writable set by importer BFS. */
@@ -421,6 +476,12 @@ export interface RepoMeta {
      *  diagnostics must show whether the write set was already
      *  under-expanded when the run died. */
     droppedImporterChunks?: number;
+    /**
+     * Why this run rebuilds (#3137), so an interrupted rebuild can name its
+     * causes on the next run. Untrusted on read: parse it with
+     * `readStoredRebuildReasons`, since the file is schema-less JSON.
+     */
+    reasons?: StoredRebuildReason[];
   };
   /**
    * Durable embedding-resume marker, written in two distinct situations that
@@ -476,6 +537,11 @@ export interface RepoMeta {
      * subset of their chunks; for `'partial'` they hold none.
      */
     pendingNodeIds?: string[];
+    /**
+     * Interrupted atomic builds only. This does not publish the staged graph
+     * or advance live embedding statistics; it identifies a recovery source.
+     */
+    recovery?: EmbeddingRecoveryReference;
   };
   /**
    * Name of the git branch this index represents (#2106). Absent for the
@@ -584,6 +650,22 @@ export interface RepoMeta {
      * unavailable. Optional for that back-compat reason.
      */
     hasCallSummary?: boolean;
+  };
+  /**
+   * The process-detection budget this index's Community/Process rows were
+   * built under (#3313). Compared on the next analyze so a budget-only
+   * config change re-detects flows without `--force`. `maxProcesses: null`
+   * means the dynamic `symbols / 10` formula. Absent on pre-#3313 metas:
+   * that absence matches default/dynamic knobs (backfill) and mismatches
+   * any explicit override.
+   */
+  processDetection?: {
+    maxProcesses: number | null;
+    maxProcessBranching: number;
+    maxProcessTraceDepth: number;
+    maxEntryPointCandidates: number;
+    /** Live Community/Process rows are not certified under this stamp (#3322). */
+    uncertified?: true;
   };
 }
 

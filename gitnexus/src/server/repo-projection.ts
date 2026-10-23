@@ -16,6 +16,7 @@ import {
 } from '../core/staleness-status.js';
 import type { ContentRetention, RepoMeta } from '../storage/repo-meta.js';
 import type { RegistryEntry } from '../storage/repo-manager.js';
+import { publicRepoId } from './public-repo-id.js';
 
 /** Retention + checkout facts computed by the route (see getSourceAvailability). */
 export interface RepoProjectionSource {
@@ -27,13 +28,18 @@ export interface RepoProjectionSource {
  * Staleness through the shared {@link stalenessPayload} builder, so this route
  * and MCP `list_repos` emit one shape for one fact (#3232 review, #3256).
  *
- * Absent when the index is current. Otherwise `staleness.status` says what git
- * could establish: `behind` with the counted `commitsBehind`; `diverged` when
- * HEAD has provably moved off the indexed commit but the history needed to
- * count the gap is gone — the state a branch-pinned `url` clone reaches once
- * git prunes the commit a failed re-index left behind; or `unknown` when the
- * repository could not be measured at all. This is a listing a monitor reads,
- * so `unknown` is included here, unlike on the hot read tools.
+ * This listing/HTTP helper uses the no-ref form: absent when the index is
+ * current; `unknown` is included via `includeUnknown`. Otherwise
+ * `staleness.status` says what git could establish: `behind` with the counted
+ * `commitsBehind`; `diverged` when HEAD has provably moved off the indexed
+ * commit but the history needed to count the gap is gone — the state a
+ * branch-pinned `url` clone reaches once git prunes the commit a failed
+ * re-index left behind; or `unknown` when the repository could not be
+ * measured at all.
+ *
+ * Hot read tools (`query`/`context`/`impact`/`cypher`) use the ref-carrying
+ * form: they emit `unknown` (and `current`) with `branch?`/`lastCommit`/
+ * `indexedAt`/`measuredAgainst`.
  *
  * All of it measures the index against the local working tree — the same thing
  * `gitnexus status` and MCP `list_repos` measure — not against the remote.
@@ -49,6 +55,8 @@ export const projectRepoListEntry = (
   staleness: StalenessInfo,
   source: RepoProjectionSource,
 ) => ({
+  // Matches `repoId` on analyze job views / SSE terminal frames.
+  id: publicRepoId(entry.path),
   name: entry.name,
   path: entry.path,
   repoPath: entry.path,

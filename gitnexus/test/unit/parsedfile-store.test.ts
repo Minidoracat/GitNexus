@@ -5,6 +5,7 @@ import { mkdtemp, rm, readdir, readFile, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import path from 'path';
 import type { ParsedFile } from 'gitnexus-shared';
+import { TEST_PARSE_IDENTITY } from '../helpers/cache-identity.js';
 import {
   clearParsedFileStore,
   persistParsedFileChunk,
@@ -26,29 +27,40 @@ import {
  * Maps — the round-trip's fidelity hinges on those Maps surviving JSON
  * serialization (they would otherwise collapse to `{}`).
  */
-const makeParsedFile = (filePath: string): ParsedFile =>
-  ({
-    filePath,
-    moduleScope: `${filePath}:module`,
-    parsedImports: [],
-    localDefs: [
-      { nodeId: `Function:${filePath}:fn`, filePath, type: 'Function', qualifiedName: 'fn' },
-    ],
-    referenceSites: [],
-    scopes: [
-      {
-        id: `${filePath}:module`,
-        parent: null,
-        kind: 'Module',
-        range: { startLine: 1, startCol: 0, endLine: 9, endCol: 0 },
-        filePath,
-        bindings: new Map([['fn', [{ defId: `Function:${filePath}:fn`, origin: 'local' }]]]),
-        ownedDefs: [],
-        imports: [],
-        typeBindings: new Map([['x', { name: 'int' }]]),
-      },
-    ],
-  }) as unknown as ParsedFile;
+const makeParsedFile = (filePath: string): ParsedFile => ({
+  filePath,
+  moduleScope: `${filePath}:module`,
+  parsedImports: [],
+  localDefs: [
+    { nodeId: `Function:${filePath}:fn`, filePath, type: 'Function', qualifiedName: 'fn' },
+  ],
+  referenceSites: [],
+  scopes: [
+    {
+      id: `${filePath}:module`,
+      parent: null,
+      kind: 'Module',
+      range: { startLine: 1, startCol: 0, endLine: 9, endCol: 0 },
+      filePath,
+      bindings: new Map([
+        [
+          'fn',
+          [
+            {
+              def: { nodeId: `Function:${filePath}:fn`, filePath, type: 'Function' },
+              origin: 'local',
+            },
+          ],
+        ],
+      ]),
+      ownedDefs: [],
+      imports: [],
+      typeBindings: new Map([
+        ['x', { rawName: 'int', declaredAtScope: `${filePath}:module`, source: 'annotation' }],
+      ]),
+    },
+  ],
+});
 
 /**
  * Store payload with arbitrary (possibly corrupt) field overrides. The one
@@ -79,9 +91,9 @@ describe('parsedfile-store', () => {
       const a = loaded.get('a.c')!;
       const scope = a.scopes[0];
       expect(scope.bindings).toBeInstanceOf(Map);
-      expect(scope.bindings.get('fn')?.[0]?.defId).toBe('Function:a.c:fn');
+      expect(scope.bindings.get('fn')?.[0]?.def.nodeId).toBe('Function:a.c:fn');
       expect(scope.typeBindings).toBeInstanceOf(Map);
-      expect((scope.typeBindings.get('x') as { name: string }).name).toBe('int');
+      expect(scope.typeBindings.get('x')?.rawName).toBe('int');
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -218,6 +230,55 @@ describe('parsedfile-store', () => {
     }
   });
 
+  it('round-trips exact call-result assignment identities', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'pfstore-'));
+    try {
+      const pf = makeStoreEntry('Scenario.swift', {
+        callResultAssignmentSites: [
+          {
+            callSite: { startLine: 3, startCol: 14, endLine: 3, endCol: 25 },
+            inScope: 'scope:run',
+            lhs: 'store',
+          },
+        ],
+      });
+      await persistParsedFileChunk(dir, 'assignment', [pf]);
+
+      const loaded = await loadParsedFilesForPaths(dir, new Set(['Scenario.swift']));
+      expect(loaded.get('Scenario.swift')?.callResultAssignmentSites).toEqual(
+        pf.callResultAssignmentSites,
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('drops malformed call-result assignments per site and rejects a non-array field', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'pfstore-'));
+    try {
+      const mixed = makeStoreEntry('mixed.swift', {
+        callResultAssignmentSites: [
+          {
+            callSite: { startLine: 3, startCol: 14, endLine: 3, endCol: 25 },
+            inScope: 'scope:run',
+            lhs: 'store',
+          },
+          { callSite: '3:14', inScope: 'scope:run', lhs: 'poison' },
+        ],
+      });
+      const garbage = makeStoreEntry('garbage.swift', {
+        callResultAssignmentSites: 'not-an-array',
+      });
+      await persistParsedFileChunk(dir, 'assignment-invalid', [mixed, garbage]);
+
+      const loaded = await loadParsedFilesForPaths(dir, new Set(['mixed.swift', 'garbage.swift']));
+      expect(loaded.get('mixed.swift')?.callResultAssignmentSites).toHaveLength(1);
+      expect(loaded.has('garbage.swift')).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('drops a malformed callable-flow site but retains the file and its other sites (per-site sanitation, #2522)', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'pfstore-'));
     try {
@@ -325,7 +386,7 @@ describe('parsedfile-store', () => {
       const loaded = await loadParsedFilesForPaths(dir, new Set(['a.c']));
       const scope = loaded.get('a.c')!.scopes[0];
       expect(scope.bindings).toBeInstanceOf(Map);
-      expect(scope.bindings.get('fn')?.[0]?.defId).toBe('Function:a.c:fn');
+      expect(scope.bindings.get('fn')?.[0]?.def.nodeId).toBe('Function:a.c:fn');
       expect(scope.typeBindings).toBeInstanceOf(Map);
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -867,9 +928,12 @@ describe('parsedfile-store receiverChain sanitation', () => {
         type: 'Function' as const,
         qualifiedName: 'fn',
       };
-      const pf = makeParsedFile('a.c');
-      (pf.localDefs as unknown as object[])[0] = def;
-      (pf.scopes[0] as { ownedDefs: object[] }).ownedDefs = [def];
+      const base = makeParsedFile('a.c');
+      const pf: ParsedFile = {
+        ...base,
+        localDefs: [def],
+        scopes: [{ ...base.scopes[0], ownedDefs: [def] }],
+      };
       await persistParsedFileChunk(dir, 'ok', [pf]);
       const loadedFile = (await loadParsedFilesForPaths(dir, new Set(['a.c']))).get('a.c');
       expect(loadedFile).toBeDefined();
@@ -990,6 +1054,82 @@ describe('parsedfile-store receiverChain sanitation', () => {
       expect(await durableChunkHasShards(live, liveOnly, new Set(['keep.c']))).toBe(true);
       expect(await durableChunkHasShards(live, rewritten, new Set(['new.c']))).toBe(true);
       expect(await durableChunkHasShards(live, rewritten, new Set(['old.c']))).toBe(false);
+    } finally {
+      await rm(live, { recursive: true, force: true });
+      await rm(staged, { recursive: true, force: true });
+    }
+  });
+
+  it('excludes a failed staged repair from the durable index even when the old directory survives', async () => {
+    const live = await mkdtemp(path.join(tmpdir(), 'pf-live-repair-'));
+    const staged = await mkdtemp(path.join(tmpdir(), 'pf-stage-repair-'));
+    const durable = getDurableParsedFileDir(live);
+    const repaired = '5'.repeat(64);
+    const healthy = '6'.repeat(64);
+    const originalRm = nodeFsPromises.rm;
+    let restoreRemove: (() => void) | undefined;
+    try {
+      persistDurableParsedFileShardSync(durable, repaired, 1, 0, [makeParsedFile('old.c')]);
+      persistDurableParsedFileShardSync(durable, healthy, 1, 0, [makeParsedFile('healthy.c')]);
+      const keys = new Set([repaired, healthy]);
+      await pruneAndSaveDurableParsedFileStore(durable, TEST_PARSE_IDENTITY.base, keys);
+      persistDurableParsedFileShardSync(getDurableParsedFileDir(staged), repaired, 2, 0, [
+        makeParsedFile('new.c'),
+      ]);
+      const liveChunk = path.join(durable, repaired);
+      const blocked = new Set([liveChunk, `${liveChunk}.replacing`]);
+      const removeSpy = vi
+        .spyOn(nodeFsPromises, 'rm')
+        .mockImplementation(async (target, options) => {
+          if (blocked.has(String(target))) {
+            throw Object.assign(new Error('simulated blocked repair'), { code: 'EACCES' });
+          }
+          return originalRm(target, options);
+        });
+      restoreRemove = () => removeSpy.mockRestore();
+
+      await mergeStagedDurableParsedFileStore(live, staged, TEST_PARSE_IDENTITY.base, keys);
+
+      // The failed replacement and failed prune both occurred. Old bytes must
+      // not regain eligibility merely because they can still be read.
+      expect(removeSpy).toHaveBeenCalledWith(`${liveChunk}.replacing`, {
+        recursive: true,
+        force: true,
+      });
+      expect(removeSpy).toHaveBeenCalledWith(liveChunk, { recursive: true, force: true });
+      expect(existsSync(liveChunk)).toBe(true);
+      expect(await loadDurableParsedFileIndex(durable, TEST_PARSE_IDENTITY.base)).toEqual(
+        new Map([[healthy, new Set(['healthy.c'])]]),
+      );
+      expect(await durableChunkHasShards(live, repaired, new Set(['new.c']))).toBe(false);
+    } finally {
+      restoreRemove?.();
+      await rm(live, { recursive: true, force: true });
+      await rm(staged, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves the live index when staging cannot be enumerated', async () => {
+    const live = await mkdtemp(path.join(tmpdir(), 'pf-live-unreadable-'));
+    const staged = await mkdtemp(path.join(tmpdir(), 'pf-stage-unreadable-'));
+    const durable = getDurableParsedFileDir(live);
+    const key = '7'.repeat(64);
+    try {
+      persistDurableParsedFileShardSync(durable, key, 1, 0, [makeParsedFile('old.c')]);
+      await pruneAndSaveDurableParsedFileStore(durable, TEST_PARSE_IDENTITY.base, new Set([key]));
+      const indexPath = path.join(durable, 'index.json');
+      const before = await readFile(indexPath);
+      // A regular file at the directory path makes readdir reject with ENOTDIR
+      // on every platform, including root, without mocking filesystem success.
+      await writeFile(getDurableParsedFileDir(staged), 'not a directory');
+
+      await expect(
+        mergeStagedDurableParsedFileStore(live, staged, TEST_PARSE_IDENTITY.base, new Set()),
+      ).rejects.toThrow();
+      expect(await readFile(indexPath)).toEqual(before);
+      expect(await loadDurableParsedFileIndex(durable, TEST_PARSE_IDENTITY.base)).toEqual(
+        new Map([[key, new Set(['old.c'])]]),
+      );
     } finally {
       await rm(live, { recursive: true, force: true });
       await rm(staged, { recursive: true, force: true });

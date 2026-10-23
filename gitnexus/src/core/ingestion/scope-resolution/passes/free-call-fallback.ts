@@ -40,10 +40,14 @@ import { GLOBAL_NAME_FALLBACK_REASON } from '../../../graph/edge-reasons.js';
 import { resolveCallerGraphId, resolveDefGraphId } from '../graph-bridge/ids.js';
 import type { CalleeIdSink } from '../graph-bridge/callee-id-sink.js';
 import {
+  sourceBindingForDefinition,
+  type SourceBindingRecorder,
+} from '../source-binding-resolution.js';
+import {
+  lookupNameClaim,
+  hasExplicitNameClaim,
   findAllCallableBindingCandidatesInScope,
   findAllCallableBindingsInScope,
-  findCallableBindingInScope,
-  findCallableBindingsAndAdlBlocker,
   findClassBindingInScope,
   findEnclosingClassDef,
   isClassFileImportGrounded,
@@ -74,6 +78,7 @@ export function emitFreeCallFallback(
     /** Per-language veto on a name guess — see
      *  `ScopeResolver.isGlobalNameFallbackPlausible`. */
     readonly isGlobalNameFallbackPlausible?: ScopeResolver['isGlobalNameFallbackPlausible'];
+    readonly resolutionConfig?: unknown;
     /** Raw source lookup handed to `isGlobalNameFallbackPlausible` (optional). */
     readonly sourceTextOf?: (filePath: string) => string | undefined;
     /** When true, `Type(...)` constructor calls link to the Class def
@@ -83,12 +88,11 @@ export function emitFreeCallFallback(
      *  appended to its reason. See `ScopeResolver.markConstructionSites`. */
     readonly markConstructionSites?: boolean;
     readonly isFileLocalDef?: (def: SymbolDefinition) => boolean;
-    readonly isCallableVisibleFromCaller?: (ctx: {
-      readonly callerParsed: ParsedFile;
-      readonly candidate: SymbolDefinition;
-      readonly callerScope?: ScopeId;
-      readonly scopes?: ScopeResolutionIndexes;
-    }) => boolean;
+    readonly isCallableVisibleFromCaller?: ScopeResolver['isCallableVisibleFromCaller'];
+    /** Whether a type named through a written qualifier (`ns.Type{}`) is
+     *  nameable from outside its namespace — `ScopeResolver.isNamespaceMemberVisible`. */
+    readonly isNamespaceMemberVisible?: ScopeResolver['isNamespaceMemberVisible'];
+    readonly resolveOrdinaryCallables?: ScopeResolver['resolveOrdinaryCallables'];
     readonly resolveAdlCandidates?: (
       site: {
         readonly name: string;
@@ -120,7 +124,9 @@ export function emitFreeCallFallback(
      *  contains the method's owner. See
      *  `ScopeResolver.freeCallsRequireInstanceOwnership`. */
     readonly freeCallsRequireInstanceOwnership?: boolean;
+    readonly implicitThisWalksMro?: boolean;
     readonly recordResolutionOutcome?: ResolutionOutcomeRecorder;
+    readonly recordSourceBinding?: SourceBindingRecorder;
     /** Call sites owned by a later precise pass (for example callable-value-flow). */
     readonly skipSites?: ReadonlySet<string>;
     /** Resolved-callee-id capture sink (#2227 U2). Threaded in under `--pdg`
@@ -144,6 +150,13 @@ export function emitFreeCallFallback(
   // defs.byId.values() at every constructor call. Same simple-name keying
   // and class-like kind filter the previous per-site scan applied.
   const globalClassesBySimpleName = buildGlobalClassIndex(scopes);
+  // `ScopeResolver.isNamespaceMemberVisible` bound once; undefined for every
+  // language that does not implement it, which leaves the class lookups as-is.
+  const memberVisibleToQualifier = options.isNamespaceMemberVisible;
+  const namespaceMemberVisible =
+    memberVisibleToQualifier === undefined
+      ? undefined
+      : (member: SymbolDefinition): boolean => memberVisibleToQualifier({ member });
   // Workspace file-path set for `resolveQualifiedFreeCall` (a module path maps
   // to a file by language convention). Built lazily and once: languages without
   // the hook never pay for it.
@@ -223,12 +236,56 @@ export function emitFreeCallFallback(
       if (site.kind !== 'call') continue;
       if (site.explicitReceiver !== undefined) continue;
       if (options.skipSites?.has(siteKey(parsed.filePath, site)) === true) continue;
+      options.recordSourceBinding?.(site, {
+        status: 'unresolved',
+        targetDefIds: [],
+        basis: 'free-call',
+      });
+      const lookupOptions = { position: site.atRange, purpose: 'value' as const };
+      const nameClaim = lookupNameClaim(site.inScope, site.name, scopes, lookupOptions);
+      const strictClaim = hasExplicitNameClaim(nameClaim, site.name);
+      const blocksCall =
+        strictClaim &&
+        (nameClaim.status === 'blocked' ||
+          (nameClaim.status === 'resolved' &&
+            !nameClaim.bindings.some(
+              (b) =>
+                b.def.type === 'Function' ||
+                b.def.type === 'Method' ||
+                b.def.type === 'Constructor' ||
+                b.def.type === 'Class' ||
+                b.def.type === 'Struct' ||
+                b.def.type === 'Record',
+            )));
+      if (blocksCall) {
+        options.recordSourceBinding?.(site, {
+          status: 'blocked',
+          targetDefIds: [],
+          basis: 'lexical-name-claim',
+        });
+        if (options.resolveAdlCandidates !== undefined) {
+          recordSuppressedOutcome(options.recordResolutionOutcome, {
+            recordSourceBinding: options.recordSourceBinding,
+            site,
+            phase: 'free-call-fallback',
+            filePath: parsed.filePath,
+            name: site.name,
+            range: site.atRange,
+            reason: 'adl-ordinary-lookup-blocked',
+            candidates: [],
+          });
+          handledSites.add(siteKey(parsed.filePath, site));
+        }
+        continue;
+      }
 
       // Constructor form (`new User(...)`): resolve the class, then
       // emit CALLS to its explicit Constructor def (when present) or
       // to the Class node itself (implicit constructor). Legacy emits
       // the same two targets; see test expectations.
       let fnDef: SymbolDefinition | undefined;
+      let writtenDefinition: SymbolDefinition | undefined;
+      let sourceCandidates: readonly SymbolDefinition[] | undefined;
       // Guess flag starts here so the constructor unique-class pick can mark
       // the same class of guess as `pickUniqueGlobalCallable` below. The
       // veto/label path keys off this flag; declaring it after that pick left
@@ -238,6 +295,13 @@ export function emitFreeCallFallback(
       // Constructor child — Go refuses any `qualifiedName` containing `.`.
       let globalFallbackVetoTarget: SymbolDefinition | undefined;
       if (site.callForm === 'constructor') {
+        // `ns.Type{}` names its type through a namespace import: a type the
+        // language will not let that qualifier reach is not found, rather than
+        // rediscovered below by its simple name (`namespaceMemberVisible`).
+        const classLookupOptions = {
+          ...lookupOptions,
+          ...(namespaceMemberVisible !== undefined ? { namespaceMemberVisible } : {}),
+        };
         // Lexical / written-qualifier first. A bare unique type with no
         // import/#include evidence is a guess (JS `new UniqueWidget()`,
         // Go unexported `uniqueWidget{}`). A unique type whose file is
@@ -251,14 +315,18 @@ export function emitFreeCallFallback(
           scopes,
           site.rawQualifiedName,
           undefined,
-          { uniqueQualifiedNameFallback: site.rawQualifiedName !== undefined },
+          {
+            ...classLookupOptions,
+            uniqueQualifiedNameFallback: site.rawQualifiedName !== undefined,
+          },
         );
         if (classDef === undefined) {
           classDef =
             findClassBindingInScope(site.inScope, site.name, scopes, undefined, {
+              ...classLookupOptions,
               uniqueQualifiedNameFallback: true,
             }) ??
-            (options.allowGlobalFallback === true
+            (options.allowGlobalFallback === true && !strictClaim
               ? pickUniqueGlobalClass(site.name, globalClassesBySimpleName)
               : undefined);
           if (
@@ -272,6 +340,7 @@ export function emitFreeCallFallback(
           }
         }
         if (classDef !== undefined && classDef.type !== 'Interface') {
+          writtenDefinition = classDef;
           // Most languages link `Type(...)` to the explicit Constructor def
           // when one exists (else the Class). Languages that model the call
           // as a reference to the type itself opt into
@@ -308,11 +377,12 @@ export function emitFreeCallFallback(
       // the same name in a single class, choose the best match by
       // arity + argument types.
       let fnDefFromImplicitThis = false;
-      if (fnDef === undefined) {
+      if (fnDef === undefined && !strictClaim) {
         fnDef = pickImplicitThisOverload(site, scopes, workspaceIndex, model, {
           conversionRankFn: options.conversionRankFn,
           conversionOnlyArgTypePrefixes: options.conversionOnlyArgTypePrefixes,
           constraintCompatibility: options.constraintCompatibility,
+          implicitThisWalksMro: options.implicitThisWalksMro,
         });
         fnDefFromImplicitThis = fnDef !== undefined;
       }
@@ -323,7 +393,10 @@ export function emitFreeCallFallback(
       // by argument types (#1578). The first-match result is kept as a
       // fallback when narrowing is indeterminate.
       if (fnDef === undefined) {
-        if (options.resolveAdlCandidates === undefined) {
+        if (
+          options.resolveAdlCandidates === undefined ||
+          options.resolveOrdinaryCallables === undefined
+        ) {
           // Non-ADL path: first-match preserves scope-chain precedence
           // (local shadows import). When a conversion-rank function is
           // available AND the binding scope contains multiple overloads,
@@ -335,19 +408,27 @@ export function emitFreeCallFallback(
               byName = new Map();
               bindingCandidatesByScope.set(site.inScope, byName);
             }
-            bindingCandidates = byName.get(site.name);
+            const cacheName = `${site.name}:${site.atRange.startLine}:${site.atRange.startCol}`;
+            bindingCandidates = byName.get(cacheName);
             if (bindingCandidates === undefined) {
               bindingCandidates = findAllCallableBindingCandidatesInScope(
                 site.inScope,
                 site.name,
                 scopes,
+                lookupOptions,
               );
-              byName.set(site.name, bindingCandidates);
+              byName.set(cacheName, bindingCandidates);
             }
           }
           let eligibleBindingCandidates: readonly CallableBindingCandidate[] | undefined;
           if (bindingCandidates === undefined) {
-            fnDef = findCallableBindingInScope(site.inScope, site.name, scopes);
+            sourceCandidates = findAllCallableBindingsInScope(
+              site.inScope,
+              site.name,
+              scopes,
+              lookupOptions,
+            );
+            fnDef = sourceCandidates[0];
           } else {
             eligibleBindingCandidates = bindingCandidates.filter((candidate) => {
               const def = candidate.def;
@@ -365,8 +446,11 @@ export function emitFreeCallFallback(
               return ownerReachable || staticallyImported;
             });
             fnDef = eligibleBindingCandidates[0]?.def;
+            sourceCandidates = eligibleBindingCandidates.map((candidate) => candidate.def);
             if (fnDef === undefined && bindingCandidates.length > 0) {
               recordSuppressedOutcome(options.recordResolutionOutcome, {
+                recordSourceBinding: options.recordSourceBinding,
+                site,
                 phase: 'free-call-fallback',
                 filePath: parsed.filePath,
                 name: site.name,
@@ -416,7 +500,7 @@ export function emitFreeCallFallback(
           ) {
             const allCallables =
               eligibleBindingCandidates === undefined
-                ? findAllCallableBindingsInScope(site.inScope, site.name, scopes)
+                ? findAllCallableBindingsInScope(site.inScope, site.name, scopes, lookupOptions)
                 : eligibleBindingCandidates.map((candidate) => candidate.def);
             if (allCallables.length > 1) {
               const narrowed = narrowOverloadCandidates(
@@ -432,6 +516,7 @@ export function emitFreeCallFallback(
               );
               if (narrowed.length === 1) {
                 fnDef = narrowed[0];
+                sourceCandidates = narrowed;
               } else if (narrowed.length > 1) {
                 // Multiple survivors after conversion-rank scoring.
                 // Suppress when all candidates share the same file (true
@@ -440,6 +525,8 @@ export function emitFreeCallFallback(
                 const sameFile = narrowed.every((d) => d.filePath === narrowed[0]!.filePath);
                 if (sameFile) {
                   recordSuppressedOutcome(options.recordResolutionOutcome, {
+                    recordSourceBinding: options.recordSourceBinding,
+                    site,
                     phase: 'free-call-fallback',
                     filePath: parsed.filePath,
                     name: site.name,
@@ -456,17 +543,17 @@ export function emitFreeCallFallback(
               }
               // narrowed.length === 0: keep the first-match fnDef —
               // preserves local-shadows-import.
+              if (narrowed.length === 0) sourceCandidates = [];
             }
           }
         } else {
-          // ADL path: ISO C++ `[basic.lookup.unqual]` §7 — ADL is suppressed
-          // when ordinary lookup finds a non-function name or a block-scope
-          // function declaration.
+          // The provider owns declaration normalization and lexical barriers
+          // for its argument-dependent candidate tier.
           const {
             callables: ordinary,
             nonCallableFound,
             blockScopeDeclFound,
-          } = findCallableBindingsAndAdlBlocker(site.inScope, site.name, scopes);
+          } = options.resolveOrdinaryCallables(site.inScope, site.name, scopes, lookupOptions);
           const adlSuppressed = nonCallableFound || blockScopeDeclFound;
           const adl = adlSuppressed
             ? undefined
@@ -485,6 +572,8 @@ export function emitFreeCallFallback(
           const key = siteKey(parsed.filePath, site);
           if (adlSuppressed && ordinary.length === 0) {
             recordSuppressedOutcome(options.recordResolutionOutcome, {
+              recordSourceBinding: options.recordSourceBinding,
+              site,
               phase: 'free-call-fallback',
               filePath: parsed.filePath,
               name: site.name,
@@ -507,42 +596,41 @@ export function emitFreeCallFallback(
             // via the unified `OverloadNarrowingHookCtx`.
             const hasConstraints = ordinary.some((d) => d.templateConstraints !== undefined);
             const canNarrow = hasConstraints || options.conversionRankFn !== undefined;
-            if (ordinary.length <= 1 || !canNarrow) {
+            if (ordinary.length === 0 || !canNarrow) {
               fnDef = ordinary[0];
+              sourceCandidates = ordinary;
             } else {
               const narrowed = narrowOverloadCandidates(ordinary, site.arity, site.argumentTypes, {
                 argumentTypeClasses: site.argumentTypeClasses,
                 conversionRankFn: options.conversionRankFn,
+                incompatibleConversionsAreFinal: blockScopeDeclFound,
                 conversionOnlyArgTypePrefixes: options.conversionOnlyArgTypePrefixes,
                 constraintCompatibility: options.constraintCompatibility,
               });
               if (narrowed.length === 1) {
                 fnDef = narrowed[0];
+                sourceCandidates = narrowed;
               } else if (narrowed.length === 0) {
                 handledSites.add(key);
                 continue;
               } else {
-                // >1 survivors: same-file → suppress (true overloads,
-                // "degrade not lie" — no edge beats a wrong one, and
-                // SFINAE-ambiguous calls land here). Cross-file →
-                // first-match (shadowing semantics).
-                const sameFile = narrowed.every((d) => d.filePath === narrowed[0]!.filePath);
-                if (sameFile) {
-                  recordSuppressedOutcome(options.recordResolutionOutcome, {
-                    phase: 'free-call-fallback',
-                    filePath: parsed.filePath,
-                    name: site.name,
-                    range: site.atRange,
-                    reason: suppressionReasonForOverload(narrowed, site.arity, {
-                      conversionRankFn: options.conversionRankFn,
-                      argumentTypes: site.argumentTypes,
-                    }),
-                    candidates: narrowed,
-                  });
-                  handledSites.add(key);
-                  continue;
-                }
-                fnDef = ordinary[0];
+                // These candidates share the selected lexical tier. Different
+                // files do not establish precedence between imported overloads.
+                recordSuppressedOutcome(options.recordResolutionOutcome, {
+                  recordSourceBinding: options.recordSourceBinding,
+                  site,
+                  phase: 'free-call-fallback',
+                  filePath: parsed.filePath,
+                  name: site.name,
+                  range: site.atRange,
+                  reason: suppressionReasonForOverload(narrowed, site.arity, {
+                    conversionRankFn: options.conversionRankFn,
+                    argumentTypes: site.argumentTypes,
+                  }),
+                  candidates: narrowed,
+                });
+                handledSites.add(key);
+                continue;
               }
             }
           } else {
@@ -566,11 +654,14 @@ export function emitFreeCallFallback(
             });
             if (narrowed.length === 1) {
               fnDef = narrowed[0];
+              sourceCandidates = narrowed;
             } else if (narrowed.length === 0) {
               handledSites.add(key);
               continue;
             } else if (narrowed.length > 1) {
               recordSuppressedOutcome(options.recordResolutionOutcome, {
+                recordSourceBinding: options.recordSourceBinding,
+                site,
                 phase: 'free-call-fallback',
                 filePath: parsed.filePath,
                 name: site.name,
@@ -604,7 +695,7 @@ export function emitFreeCallFallback(
       // visibility rules forbid (below), and every edge that survives is
       // emitted with `GLOBAL_NAME_FALLBACK_REASON` at 0.5 rather than
       // masquerading as `import-resolved` at 0.85 (see the emit site).
-      if (fnDef === undefined && options.allowGlobalFallback === true) {
+      if (fnDef === undefined && options.allowGlobalFallback === true && !strictClaim) {
         fnDef = pickUniqueGlobalCallable(
           site.name,
           model,
@@ -617,6 +708,7 @@ export function emitFreeCallFallback(
                 options.isCallableVisibleFromCaller!({
                   callerParsed: parsed,
                   candidate,
+                  callArity: site.arity,
                   callerScope: site.inScope,
                   scopes,
                 })
@@ -650,6 +742,7 @@ export function emitFreeCallFallback(
           options.isGlobalNameFallbackPlausible?.({
             callerParsed: parsed,
             candidate: vetoCandidate,
+            resolutionConfig: options.resolutionConfig,
             parsedFileOf: parsedFileByPath(),
             sourceTextOf: options.sourceTextOf,
             site: {
@@ -675,9 +768,45 @@ export function emitFreeCallFallback(
           continue;
         }
       }
-      if (fnDef === undefined) continue;
+      if (fnDef === undefined) {
+        // A class called with ordinary call syntax still names its type, even
+        // when no constructor method exists for a runtime CALLS edge.
+        if (options.recordSourceBinding !== undefined) {
+          const classes = [
+            ...new Map(
+              nameClaim.bindings
+                .filter(
+                  (binding) =>
+                    binding.def.type === 'Class' ||
+                    binding.def.type === 'Struct' ||
+                    binding.def.type === 'Record',
+                )
+                .map((binding) => [binding.def.nodeId, binding.def]),
+            ).values(),
+          ];
+          if (classes.length === 1)
+            options.recordSourceBinding(
+              site,
+              sourceBindingForDefinition(
+                classes[0]!,
+                'construction',
+                nameClaim.bindings,
+                nameClaim.scope?.id,
+              ),
+            );
+          else if (classes.length > 1)
+            options.recordSourceBinding(site, {
+              status: 'ambiguous',
+              targetDefIds: classes.map((candidate) => candidate.nodeId),
+              basis: 'construction',
+            });
+        }
+        continue;
+      }
       if (fnDef.isDeleted === true) {
         recordSuppressedOutcome(options.recordResolutionOutcome, {
+          recordSourceBinding: options.recordSourceBinding,
+          site,
           phase: 'free-call-fallback',
           filePath: parsed.filePath,
           name: site.name,
@@ -694,14 +823,72 @@ export function emitFreeCallFallback(
         !options.isCallableVisibleFromCaller({
           callerParsed: parsed,
           candidate: fnDef,
+          callArity: site.arity,
           callerScope: site.inScope,
           scopes,
         })
       ) {
+        options.recordSourceBinding?.(site, {
+          status: 'blocked',
+          targetDefIds: [fnDef.nodeId],
+          basis: 'callable-visibility',
+        });
         handledSites.add(siteKey(parsed.filePath, site));
         continue;
       }
-      const callerGraphId = resolveCallerGraphId(site.inScope, scopes, nodeLookup, site.atRange);
+      // Observe the source declaration BEFORE constructor retargeting, caller
+      // mapping and edge collapse can discard or change its identity.
+      if (options.recordSourceBinding !== undefined) {
+        const sourceDef = writtenDefinition ?? fnDef;
+        const candidateIds = [
+          ...new Set(sourceCandidates?.map((candidate) => candidate.nodeId) ?? [sourceDef.nodeId]),
+        ];
+        options.recordSourceBinding(
+          site,
+          fnDefFromGlobalNameFallback
+            ? {
+                status: 'unresolved',
+                targetDefIds: [sourceDef.nodeId],
+                basis: 'global-name-fallback',
+              }
+            : candidateIds.length === 0
+              ? {
+                  status: 'unresolved',
+                  targetDefIds: [sourceDef.nodeId],
+                  basis: 'free-call-incompatible',
+                }
+              : candidateIds.length > 1
+                ? {
+                    ...sourceBindingForDefinition(
+                      sourceDef,
+                      'free-call-candidates',
+                      nameClaim.bindings,
+                      nameClaim.scope?.id,
+                    ),
+                    status: 'ambiguous',
+                    targetDefIds: candidateIds,
+                    basis: 'free-call-candidates',
+                    ...(sourceCandidates !== undefined &&
+                    candidateIds.every((id) =>
+                      nameClaim.bindings.some((binding) => binding.def.nodeId === id),
+                    )
+                      ? { candidatesComplete: true as const }
+                      : {}),
+                  }
+                : sourceBindingForDefinition(
+                    sourceDef,
+                    writtenDefinition === undefined ? 'free-call' : 'construction',
+                    nameClaim.bindings,
+                    nameClaim.scope?.id,
+                  ),
+        );
+      }
+      const callerGraphId = resolveCallerGraphId(
+        site.callerScope ?? site.inScope,
+        scopes,
+        nodeLookup,
+        site.atRange,
+      );
       if (callerGraphId === undefined) continue;
       const tgtGraphId = resolveDefGraphId(fnDef.filePath, fnDef, nodeLookup);
       if (tgtGraphId === undefined) continue;
@@ -853,8 +1040,16 @@ function recordSuppressedOutcome(
     };
     readonly reason: ResolutionSuppressionReason;
     readonly candidates: readonly SymbolDefinition[];
+    readonly site?: ReferenceSite;
+    readonly recordSourceBinding?: SourceBindingRecorder;
   },
 ): void {
+  if (input.site !== undefined)
+    input.recordSourceBinding?.(input.site, {
+      status: input.candidates.length > 1 ? 'ambiguous' : 'blocked',
+      targetDefIds: input.candidates.map((candidate) => candidate.nodeId),
+      basis: input.reason,
+    });
   record?.({
     kind: 'suppressed',
     phase: input.phase,
@@ -1165,11 +1360,14 @@ export function pickUniqueGlobalClass(
  *  pick a method member by name with overload narrowing on arity +
  *  argument types. Returns undefined if there's no enclosing class,
  *  no matching method, OR narrowing leaves multiple compatible
- *  candidates — in the multi-candidate case, picking
- *  `candidates[0]` would emit a high-confidence CALLS edge whose
- *  target depends on registration order rather than a defensible
- *  resolution. Mirrors `pickUniqueGlobalCallable`'s uniqueness check
- *  in the same file (Codex PR #1497 review, finding 2).
+ *  candidates — except when those survivors are a protocol/interface
+ *  requirement plus exactly one extension witness, in which case the
+ *  witness (the default body) is returned. An inherited class, struct,
+ *  or enum member still wins over a protocol-extension default.
+ *  Picking `candidates[0]` would emit a high-confidence CALLS edge
+ *  whose target depends on registration order rather than a
+ *  defensible resolution. Mirrors `pickUniqueGlobalCallable`'s
+ *  uniqueness check in the same file (Codex PR #1497 review, finding 2).
  *
  *  Exported for unit testing — language-agnostic logic, exercised
  *  via synthetic stubs in `pick-implicit-this-overload.test.ts`. The
@@ -1189,6 +1387,7 @@ export function pickImplicitThisOverload(
     readonly conversionRankFn?: ConversionRankFn;
     readonly conversionOnlyArgTypePrefixes?: readonly string[];
     readonly constraintCompatibility?: ScopeResolver['constraintCompatibility'];
+    readonly implicitThisWalksMro?: boolean;
   },
 ): SymbolDefinition | undefined {
   // Find the enclosing Class scope by walking parents.
@@ -1209,22 +1408,118 @@ export function pickImplicitThisOverload(
   const classDefId = workspaceIndex.classScopeIdToDefId.get(classScopeId);
   if (classDefId === undefined) return undefined;
 
-  const overloads = model.methods.lookupAllByOwner(classDefId, site.name);
-  if (overloads.length === 0) return undefined;
-  if (overloads.length === 1) return overloads[0];
+  // Bare calls in an instance method use the same implicit receiver as
+  // `self.member()`. Prefer declarations on the enclosing type; when the
+  // language opts into MRO implicit-this, walk inherited owners
+  // nearest-first and arity-narrow per owner. Compatible-but-ambiguous
+  // on a nearer ancestor fail-closes — do not fall through to a farther
+  // override. Falling through to the global name lookup makes inherited
+  // defaults depend on file order.
+  const own = model.methods.lookupAllByOwner(classDefId, site.name);
+  const ownPicked = pickUniqueImplicitThisCandidate(own, site, hookCtx, workspaceIndex);
+  if (ownPicked !== undefined) return ownPicked;
+  if (own.length > 0) {
+    const ownCompatible = narrowOverloadCandidates(own, site.arity, site.argumentTypes, {
+      argumentTypeClasses: site.argumentTypeClasses,
+      conversionRankFn: hookCtx?.conversionRankFn,
+      conversionOnlyArgTypePrefixes: hookCtx?.conversionOnlyArgTypePrefixes,
+      constraintCompatibility: hookCtx?.constraintCompatibility,
+    });
+    if (ownCompatible.length > 0) return undefined;
+  }
+  if (hookCtx?.implicitThisWalksMro !== true) return undefined;
 
-  // Narrow on arity + argument types. Require a UNIQUE survivor —
-  // ambiguous narrowing (multiple compatible candidates with no
-  // disambiguating signal) leaves the call unresolved rather than
-  // routing to an arbitrary first overload by registration order.
+  for (const ownerId of scopes.methodDispatch?.mroFor(classDefId) ?? []) {
+    const inherited = model.methods.lookupAllByOwner(ownerId, site.name);
+    const inheritedPicked = pickUniqueImplicitThisCandidate(
+      inherited,
+      site,
+      hookCtx,
+      workspaceIndex,
+    );
+    if (inheritedPicked !== undefined) return inheritedPicked;
+    if (inherited.length > 0) {
+      const inheritedCompatible = narrowOverloadCandidates(
+        inherited,
+        site.arity,
+        site.argumentTypes,
+        {
+          argumentTypeClasses: site.argumentTypeClasses,
+          conversionRankFn: hookCtx?.conversionRankFn,
+          conversionOnlyArgTypePrefixes: hookCtx?.conversionOnlyArgTypePrefixes,
+          constraintCompatibility: hookCtx?.constraintCompatibility,
+        },
+      );
+      if (inheritedCompatible.length > 0) return undefined;
+    }
+  }
+  return undefined;
+}
+
+function pickUniqueImplicitThisCandidate(
+  overloads: readonly SymbolDefinition[],
+  site: {
+    readonly arity?: number;
+    readonly argumentTypes?: readonly string[];
+    readonly argumentTypeClasses?: readonly import('gitnexus-shared').ParameterTypeClass[];
+  },
+  hookCtx:
+    | {
+        readonly conversionRankFn?: ConversionRankFn;
+        readonly conversionOnlyArgTypePrefixes?: readonly string[];
+        readonly constraintCompatibility?: ScopeResolver['constraintCompatibility'];
+      }
+    | undefined,
+  workspaceIndex: WorkspaceResolutionIndex,
+): SymbolDefinition | undefined {
+  if (overloads.length === 0) return undefined;
   const candidates = narrowOverloadCandidates(overloads, site.arity, site.argumentTypes, {
     argumentTypeClasses: site.argumentTypeClasses,
     conversionRankFn: hookCtx?.conversionRankFn,
     conversionOnlyArgTypePrefixes: hookCtx?.conversionOnlyArgTypePrefixes,
     constraintCompatibility: hookCtx?.constraintCompatibility,
   });
-  if (candidates.length !== 1) return undefined;
-  return candidates[0];
+  if (candidates.length === 0) return undefined;
+  if (candidates.length === 1) return candidates[0];
+  const witnesses = preferExtensionWitnesses(candidates, workspaceIndex);
+  return witnesses.length === 1 ? witnesses[0] : undefined;
+}
+
+function preferExtensionWitnesses(
+  candidates: readonly SymbolDefinition[],
+  workspaceIndex: WorkspaceResolutionIndex,
+): readonly SymbolDefinition[] {
+  const onOwnerType: SymbolDefinition[] = [];
+  const extensionWitnesses: SymbolDefinition[] = [];
+  for (const def of candidates) {
+    const ownerId = def.ownerId;
+    if (ownerId === undefined) {
+      extensionWitnesses.push(def);
+      continue;
+    }
+    const ownerScope = workspaceIndex.classScopeByDefId?.get(ownerId);
+    const livesOnOwner =
+      ownerScope?.ownedDefs.some((owned) => owned.nodeId === def.nodeId) === true;
+    if (livesOnOwner) onOwnerType.push(def);
+    else extensionWitnesses.push(def);
+  }
+  if (extensionWitnesses.length === 0 || onOwnerType.length === 0) return candidates;
+  const concrete = onOwnerType.filter((def) => !isProtocolLikeOwner(def.ownerId, workspaceIndex));
+  if (concrete.length > 0) return concrete;
+  return extensionWitnesses;
+}
+
+function isProtocolLikeOwner(
+  ownerId: string | undefined,
+  workspaceIndex: WorkspaceResolutionIndex,
+): boolean {
+  if (ownerId === undefined) return false;
+  const ownerScope = workspaceIndex.classScopeByDefId?.get(ownerId);
+  if (ownerScope === undefined) return false;
+  return ownerScope.ownedDefs.some(
+    (owned) =>
+      owned.nodeId === ownerId && (owned.type === 'Protocol' || owned.type === 'Interface'),
+  );
 }
 
 /**

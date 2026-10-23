@@ -8,6 +8,19 @@
  * CORS is restricted to localhost, private/LAN networks, and the deployed site.
  */
 
+import {
+  acquireIndexLock,
+  IndexLockTimeoutError,
+  requireExclusiveIndexLock,
+  sweepStagingArtifacts,
+  type IndexLockHandle,
+} from '../storage/index-lock.js';
+import { ensurePrivateSharedGraph } from '../core/shared-store-analyze.js';
+import { resolveGraphPath } from '../storage/shared-store.js';
+import {
+  reclaimAfterSlotRemoval,
+  removeCheckoutStorage,
+} from '../storage/shared-store-lifecycle.js';
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
@@ -38,6 +51,7 @@ import {
   withLbugDb,
   isReadOnlyDbError,
 } from '../core/lbug/lbug-adapter.js';
+import { assertReadOnlyFtsCrashSafe } from '../core/lbug/sidecar-recovery.js';
 import { isValidQueryParams } from '../core/lbug/query-params.js';
 import { NODE_TABLES, type GraphNode, type GraphRelationship } from 'gitnexus-shared';
 import { searchFTSFromLbug } from '../core/search/bm25-index.js';
@@ -104,6 +118,7 @@ import {
   buildServerInfo,
   createServeUpdateController,
 } from './update-controller.js';
+import { buildOpsSnapshot, isGitNexusVercelOrigin, serializeOpsJob } from './ops-snapshot.js';
 
 export {
   bindServeUpdateControllerLifecycle,
@@ -124,7 +139,11 @@ export {
  *     10.0.0.0/8      → 10.x.x.x
  *     172.16.0.0/12   → 172.16.x.x – 172.31.x.x
  *     192.168.0.0/16  → 192.168.x.x
- * - https://gitnexus.vercel.app — the deployed GitNexus web UI
+ * - https://gitnexus.vercel.app and https://gitnexus-web.vercel.app —
+ *   first-party GitNexus web UI production hosts (ops dashboard included).
+ *   Preview hosts cannot set GITNEXUS_PUBLIC_ORIGIN until serve auth exists
+ *   (`assertServeAuthForPublicOrigin` refuses to start). Reach them through a
+ *   proxy that authenticates, or bind loopback.
  * - the origin named by GITNEXUS_PUBLIC_ORIGIN, when set — matched on hostname
  *   always, and on scheme and port when the configured value carries them
  *
@@ -145,7 +164,7 @@ export const isAllowedOrigin = (origin: string | undefined): boolean => {
     origin === 'http://127.0.0.1' ||
     origin.startsWith('http://[::1]:') ||
     origin === 'http://[::1]' ||
-    origin === 'https://gitnexus.vercel.app'
+    isGitNexusVercelOrigin(origin)
   ) {
     return true;
   }
@@ -532,7 +551,7 @@ const mapGraphRelationshipRow = (row: any): GraphRelationship => ({
   sourceId: row.sourceId,
   targetId: row.targetId,
   confidence: row.confidence,
-  reason: row.reason,
+  reason: row.reason ?? '',
   step: row.step,
 });
 
@@ -585,6 +604,12 @@ export const streamGraphNdjson = async (
   });
 };
 
+const httpErrorBody = (err: any, fallback: string): { error: string; code?: string } => {
+  const body: { error: string; code?: string } = { error: err.message || fallback };
+  if (typeof err?.code === 'string') body.code = err.code;
+  return body;
+};
+
 const statusFromError = (err: any): number => {
   // Validation helpers throw BadRequestError / ForbiddenError with a typed
   // .status field — honor it before falling back to message-string matching.
@@ -604,6 +629,17 @@ const requestedRepo = (req: express.Request): string | undefined => {
   }
 
   return undefined;
+};
+
+/**
+ * Hold-queue opt-out for process/cluster GETs. Default is wait (same as
+ * `/api/repo`). `?awaitAnalysis=false` skips the 300s resolveRepo hold so a
+ * caller can fail fast instead of parking a connection on an in-flight analyze.
+ */
+export const parseAwaitAnalysisQuery = (value: unknown): boolean => {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== 'string') return true;
+  return raw !== 'false' && raw !== '0';
 };
 
 const repoParamBasename = (repoName: string): string =>
@@ -654,6 +690,19 @@ export const resolveRegisteredRepoEntry = (
     repos.find((r) => r.name.toLowerCase() === normalizedName.toLowerCase()) ||
     null
   );
+};
+
+/** HTTP omit-`?repo=` policy: MCP returns 400 when multiple repos are indexed. */
+export const resolveOmittedRepoSelection = (
+  repos: RegistryEntry[],
+): { ok: true; entry: RegistryEntry } | { ok: false; status: 400 | 404; error: string } => {
+  if (repos.length === 1) return { ok: true, entry: repos[0]! };
+  if (repos.length === 0) return { ok: false, status: 404, error: 'Repository not found' };
+  return {
+    ok: false,
+    status: 400,
+    error: `Multiple repositories indexed. Specify which one with the "repo" parameter. Available: ${repos.map((r) => r.name).join(', ')}`,
+  };
 };
 
 export interface SourceAvailability {
@@ -767,7 +816,19 @@ export const handleFileRequest = async (
       return;
     }
 
-    const raw = await fs.readFile(fullPath, 'utf-8');
+    // The lexical check above cannot see symlinks: a repo cloned from an
+    // untrusted remote can contain `evil -> /etc/passwd` (or `-> ../../..`)
+    // that passes `path.relative` and is then followed by readFile. Re-check
+    // containment on the resolved (realpath) form of both sides. A missing
+    // file throws ENOENT here and keeps its 404 below.
+    const [realRoot, realFull] = await Promise.all([fs.realpath(repoRoot), fs.realpath(fullPath)]);
+    const realRel = path.relative(realRoot, realFull);
+    if (realRel === '..' || realRel.startsWith(`..${path.sep}`) || path.isAbsolute(realRel)) {
+      res.status(403).json({ error: 'Path traversal denied' });
+      return;
+    }
+
+    const raw = await fs.readFile(realFull, 'utf-8');
 
     // Optional line-range support: ?startLine=10&endLine=50
     // Returns only the requested slice (0-indexed), plus metadata.
@@ -824,6 +885,26 @@ function readOnlyFtsOptions(skipFts?: true): { readOnly: true; skipFts?: true } 
   return skipFts ? { readOnly: true, skipFts: true } : { readOnly: true };
 }
 
+/**
+ * The server's `resolveRepo` returns `{ __timedOut: true, repoName }` when it
+ * waited the full hold-queue window for an in-flight analysis. Every route
+ * that resolves a repo must handle that sentinel — treating it as a registry
+ * entry crashes on `entry.storagePath` ("path argument must be of type
+ * string", surfaced as a 500). Returns true when a 503 was sent and the
+ * caller should return.
+ */
+export const respondIfAnalysisPending = (
+  entry: unknown,
+  res: { status: (code: number) => { json: (body: unknown) => void } },
+): boolean => {
+  const sentinel = entry as { __timedOut?: boolean; repoName?: string } | null | undefined;
+  if (!sentinel?.__timedOut) return false;
+  res.status(503).json({
+    error: `Repository analysis for "${sentinel.repoName}" is taking longer than expected. Please try again in a moment.`,
+  });
+  return true;
+};
+
 export const handleQueryRequest = async (
   req: express.Request,
   res: express.Response,
@@ -848,7 +929,8 @@ export const handleQueryRequest = async (
       res.status(404).json({ error: 'Repository not found' });
       return;
     }
-    const lbugPath = path.join(entry.storagePath, 'lbug');
+    if (respondIfAnalysisPending(entry, res)) return;
+    const lbugPath = resolveGraphPath(entry.storagePath);
     const { skipFts } = await loadFtsSession(entry.storagePath);
     const result = await withLbugDb(
       lbugPath,
@@ -862,7 +944,7 @@ export const handleQueryRequest = async (
       res.status(403).json({ error: 'Write queries are not allowed via the HTTP API' });
       return;
     }
-    res.status(500).json({ error: err.message || 'Query failed' });
+    res.status(500).json(httpErrorBody(err, 'Query failed'));
   }
 };
 
@@ -914,6 +996,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
   const app = express();
   app.disable('x-powered-by');
+  const serverStartedAt = Date.now();
 
   // Which upstream hops may set X-Forwarded-*. Process-wide: every route's
   // req.ip, and so the per-IP rate limiter, resolves through this.
@@ -947,6 +1030,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // global body parser so rejected requests do not consume the JSON budget.
   installServeMcpAuth(app);
   app.use(express.json({ limit: '10mb' }));
+  // Express 5 leaves `req.body` undefined when no parser matched (e.g. a POST
+  // without `Content-Type: application/json`). Route handlers read
+  // `req.body.<field>` directly, so normalize to an empty object and let their
+  // own "Missing X in request body" 400s fire instead of a TypeError 500.
+  app.use((req, _res, next) => {
+    if (req.body == null) req.body = {};
+    next();
+  });
 
   // Origin guard for write routes: loopback, the server's own bound host, and
   // any configured public origin — prevents CSRF from other devices.
@@ -1017,7 +1108,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     repoName?: string,
     isRetry = false,
     req?: any,
-    options: { validateStorage?: boolean } = {},
+    options: { validateStorage?: boolean; awaitAnalysis?: boolean } = {},
   ): Promise<any> => {
     const repos = await listRegisteredRepos({
       validate: options.validateStorage !== false,
@@ -1032,7 +1123,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     // analyzing this repo. Hold the connection open (up to 5 minutes) until it completes.
     // We only wait for in-progress jobs ('queued'|'cloning'|'analyzing') — a 'complete' job
     // whose repo is still missing means the registry sync failed; the fallback below handles it.
-    if (!found && normalizedName) {
+    if (!found && normalizedName && options.awaitAnalysis !== false) {
       const lower = normalizedName.toLowerCase();
 
       // Track client disconnect to cancel the wait early
@@ -1061,7 +1152,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           for (let wait = 0; wait < HOLD_QUEUE_TIMEOUT_SECS; wait++) {
             if (clientGone) return null; // client disconnected — stop polling
             const currentJob = jobManager.getJob(job.id);
-            if (!currentJob || currentJob.status === 'failed') break;
+            if (!currentJob || currentJob.status === 'failed') {
+              // The job is over and produced no registry entry. This is a
+              // plain "not found", not "still analyzing" — falling through to
+              // the timed-out sentinel here told callers to keep waiting for
+              // a job that had already failed.
+              return null;
+            }
             if (currentJob.status === 'complete') {
               await backend.init();
               const freshRepos = await listRegisteredRepos({
@@ -1171,12 +1268,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
       // Timed out waiting for an active analysis job
-      if (entry.__timedOut) {
-        res.status(503).json({
-          error: `Repository analysis for "${entry.repoName}" is taking longer than expected. Please try again in a moment.`,
-        });
-        return;
-      }
+      if (respondIfAnalysisPending(entry, res)) return;
       const meta = await loadMeta(entry.storagePath);
       const [staleness, availability] = await Promise.all([
         checkStalenessAsync(entry.path, resolveLastCommit(entry, meta)),
@@ -1210,6 +1302,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
+      if (respondIfAnalysisPending(entry, res)) return;
       let storagePath: string;
       try {
         storagePath = await requireDeletableStoragePath(entry);
@@ -1236,8 +1329,22 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           await closeLbug();
         } catch {}
 
-        // 1. Delete the .gitnexus index/storage directory
-        await fs.rm(storagePath, { recursive: true, force: true }).catch(() => {});
+        // 1. Delete the index storage and unregister, as `gitnexus remove`
+        // does: for a shared-store slot the unregister and the checkout's
+        // pointer removal run under the slot's index lock. An analyze holding
+        // that lock is a conflict; any other failure propagates as a 500 with
+        // the entry left registered, so the delete can be retried.
+        const { unregisterRepo } = await import('../storage/repo-manager.js');
+        try {
+          await removeCheckoutStorage(storagePath, () => unregisterRepo(entry.path), entry.path);
+        } catch (err) {
+          if (!(err instanceof IndexLockTimeoutError)) throw err;
+          res.status(409).json({
+            error: `Repository "${entry.name}" is being analyzed; retry the delete when it finishes. ${err.message}`,
+          });
+          return;
+        }
+        await reclaimAfterSlotRemoval(storagePath);
 
         // 2. Delete the cloned repo dir if it lives under ~/.gitnexus/repos/.
         // getCloneDir now throws on names that are not filesystem-safe (e.g.
@@ -1275,11 +1382,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           await fs.rm(resolvedEntry, { recursive: true, force: true }).catch(() => {});
         }
 
-        // 3. Unregister from the global registry
-        const { unregisterRepo } = await import('../storage/repo-manager.js');
-        await unregisterRepo(entry.path);
-
-        // 4. Reinitialize backend to reflect the removal
+        // 3. Reinitialize backend to reflect the removal
         await backend.init().catch(() => {});
 
         res.json({ deleted: entry.name });
@@ -1299,7 +1402,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
-      const lbugPath = path.join(entry.storagePath, 'lbug');
+      if (respondIfAnalysisPending(entry, res)) return;
+      const lbugPath = resolveGraphPath(entry.storagePath);
       const includeContent = req.query.includeContent === 'true';
       const stream = req.query.stream === 'true';
       const { skipFts } = await loadFtsSession(entry.storagePath);
@@ -1358,17 +1462,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       if (err instanceof ClientDisconnectedError) {
         return;
       }
-      const message = err.message || 'Failed to build graph';
+      const body = httpErrorBody(err, 'Failed to build graph');
       if (res.headersSent) {
         try {
-          res.write(JSON.stringify({ type: 'error', error: message }) + '\n');
+          res.write(JSON.stringify({ type: 'error', ...body }) + '\n');
         } catch {
           // Best-effort only after streaming has started.
         }
         res.end();
         return;
       }
-      res.status(500).json({ error: message });
+      res.status(500).json(body);
     }
   });
 
@@ -1391,7 +1495,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
-      const lbugPath = path.join(entry.storagePath, 'lbug');
+      if (respondIfAnalysisPending(entry, res)) return;
+      const lbugPath = resolveGraphPath(entry.storagePath);
       const parsedLimit = Number(req.body.limit ?? 10);
       const { ftsDisabledReason, skipFts } = await loadFtsSession(entry.storagePath);
       const limit = Number.isFinite(parsedLimit)
@@ -1552,7 +1657,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       res.json(response);
     } catch (err: any) {
       if (sendStorageRequirementHttp(err, res)) return;
-      res.status(500).json({ error: err.message || 'Search failed' });
+      res.status(500).json(httpErrorBody(err, 'Search failed'));
     }
   });
 
@@ -1565,6 +1670,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
+      if (respondIfAnalysisPending(entry, res)) return;
       await handleFileRequest(req, res, entry.path, await getSourceAvailability(entry));
     } catch (err: any) {
       if (sendStorageRequirementHttp(err, res)) return;
@@ -1584,6 +1690,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
+      if (respondIfAnalysisPending(entry, res)) return;
       const sourceAvailability = await getSourceAvailability(entry);
       if (!sourceAvailability.available) {
         sendSourceUnavailable(res, sourceAvailability);
@@ -1596,7 +1703,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const repoRoot = path.resolve(entry.path);
       const { skipFts } = await loadFtsSession(entry.storagePath);
 
-      const lbugPath = path.join(entry.storagePath, 'lbug');
+      const lbugPath = resolveGraphPath(entry.storagePath);
       const fileRows = await withLbugDb(
         lbugPath,
         () =>
@@ -1623,22 +1730,62 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       res.json({ results, ...(timedOut ? { timedOut: true } : {}) });
     } catch (err: any) {
       if (sendStorageRequirementHttp(err, res)) return;
-      res.status(statusFromError(err)).json({ error: err.message || 'Grep failed' });
+      res.status(statusFromError(err)).json(httpErrorBody(err, 'Grep failed'));
     }
   });
 
+  // Process / cluster routes resolve `?repo=` through the HTTP resolver
+  // (`resolveRepo` → `resolveRegisteredRepoEntry`) and hand the backend the
+  // registered ABSOLUTE path. Passing the raw param straight to the MCP
+  // resolver bypassed the policy documented on `resolveRegisteredRepoEntry`:
+  // a bare-name miss ran a CWD-relative realpathSync probe on attacker input
+  // and a full registry refresh, and a partial name (`?repo=core`) could
+  // silently pick `my-core-lib`. Same 60 rpm/IP limiter as `/api/repo`.
+  const resolveBackendRepoPath = async (
+    req: express.Request,
+    res: express.Response,
+  ): Promise<string | null> => {
+    // Pass `req` so resolveRepo can abort its hold-queue wait when the client
+    // disconnects (close listener is only registered when `req` is supplied).
+    const requested = requestedRepo(req);
+    let entry;
+    if (!requested) {
+      const omitted = resolveOmittedRepoSelection(await listRegisteredRepos({ validate: true }));
+      if (omitted.ok === false) {
+        res.status(omitted.status).json({ error: omitted.error });
+        return null;
+      }
+      // Keep this snapshot's sole entry. resolveRepo(undefined) would list
+      // again and map an omitted name to repos[0] of a newer registry.
+      entry = await validateResolvedRepoEntry(omitted.entry);
+    } else {
+      entry = await resolveRepo(requested, false, req, {
+        awaitAnalysis: parseAwaitAnalysisQuery(req.query.awaitAnalysis),
+      });
+    }
+    if (!entry) {
+      res.status(404).json({ error: 'Repository not found' });
+      return null;
+    }
+    if (respondIfAnalysisPending(entry, res)) return null;
+    return entry.path as string;
+  };
+
   // List all processes
-  app.get('/api/processes', async (req, res) => {
+  app.get('/api/processes', createRouteLimiter(), async (req, res) => {
     try {
-      const result = await backend.queryProcesses(requestedRepo(req));
+      const repoPath = await resolveBackendRepoPath(req, res);
+      if (repoPath === null) return;
+      const result = await backend.queryProcesses(repoPath);
       res.json(result);
     } catch (err: any) {
-      res.status(statusFromError(err)).json({ error: err.message || 'Failed to query processes' });
+      if (sendStorageRequirementHttp(err, res)) return;
+      res.status(statusFromError(err)).json(httpErrorBody(err, 'Failed to query processes'));
     }
   });
 
   // Process detail
-  app.get('/api/process', async (req, res) => {
+  app.get('/api/process', createRouteLimiter(), async (req, res) => {
     try {
       const name = String(req.query.name ?? '').trim();
       if (!name) {
@@ -1646,31 +1793,35 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
-      const result = await backend.queryProcessDetail(name, requestedRepo(req));
+      const repoPath = await resolveBackendRepoPath(req, res);
+      if (repoPath === null) return;
+      const result = await backend.queryProcessDetail(name, repoPath);
       if (result?.error) {
         res.status(404).json({ error: result.error });
         return;
       }
       res.json(result);
     } catch (err: any) {
-      res
-        .status(statusFromError(err))
-        .json({ error: err.message || 'Failed to query process detail' });
+      if (sendStorageRequirementHttp(err, res)) return;
+      res.status(statusFromError(err)).json(httpErrorBody(err, 'Failed to query process detail'));
     }
   });
 
   // List all clusters
-  app.get('/api/clusters', async (req, res) => {
+  app.get('/api/clusters', createRouteLimiter(), async (req, res) => {
     try {
-      const result = await backend.queryClusters(requestedRepo(req));
+      const repoPath = await resolveBackendRepoPath(req, res);
+      if (repoPath === null) return;
+      const result = await backend.queryClusters(repoPath);
       res.json(result);
     } catch (err: any) {
-      res.status(statusFromError(err)).json({ error: err.message || 'Failed to query clusters' });
+      if (sendStorageRequirementHttp(err, res)) return;
+      res.status(statusFromError(err)).json(httpErrorBody(err, 'Failed to query clusters'));
     }
   });
 
   // Cluster detail
-  app.get('/api/cluster', async (req, res) => {
+  app.get('/api/cluster', createRouteLimiter(), async (req, res) => {
     try {
       const name = String(req.query.name ?? '').trim();
       if (!name) {
@@ -1678,16 +1829,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
-      const result = await backend.queryClusterDetail(name, requestedRepo(req));
+      const repoPath = await resolveBackendRepoPath(req, res);
+      if (repoPath === null) return;
+      const result = await backend.queryClusterDetail(name, repoPath);
       if (result?.error) {
         res.status(404).json({ error: result.error });
         return;
       }
       res.json(result);
     } catch (err: any) {
-      res
-        .status(statusFromError(err))
-        .json({ error: err.message || 'Failed to query cluster detail' });
+      if (sendStorageRequirementHttp(err, res)) return;
+      res.status(statusFromError(err)).json(httpErrorBody(err, 'Failed to query cluster detail'));
     }
   });
 
@@ -1828,7 +1980,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 // url+branch: same value as registryName (dir basename), not
                 // the extractWebRepoName stem used only as getCloneDir's first arg.
                 repoName: analyzeBranch ? path.basename(targetPath) : repoName,
-                progress: { phase: 'cloning', percent: 0, message: `Cloning ${repoUrl}...` },
+                // Never put repoUrl in progress — ops feed is unauthenticated
+                // and may still serialize message (credentials via userinfo).
+                progress: {
+                  phase: 'cloning',
+                  percent: 0,
+                  message: `Cloning ${analyzeBranch ? path.basename(targetPath) : repoName}...`,
+                },
               });
 
               await cloneOrPull(
@@ -1909,17 +2067,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       res.status(404).json({ error: 'Job not found' });
       return;
     }
-    res.json({
-      id: job.id,
-      status: job.status,
-      repoUrl: job.repoUrl,
-      repoPath: job.repoPath,
-      repoName: job.repoName,
-      progress: job.progress,
-      error: job.error,
-      startedAt: job.startedAt,
-      completedAt: job.completedAt,
-    });
+    // Same public serializer as `/api/ops` — job ids on the ops feed must not
+    // unlock raw repoUrl/repoPath/userinfo through this pre-existing poll.
+    res.json(serializeOpsJob(job, 'analyze'));
   });
 
   // GET /api/analyze/:jobId/progress — SSE stream (shared helper)
@@ -1938,7 +2088,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       return;
     }
     jobManager.cancelJob(jobId, 'Cancelled by user');
-    res.json({ id: job.id, status: 'failed', error: 'Cancelled by user' });
+    // Live JobManager view: a registered child stays non-terminal until exit.
+    // Hard-coding `failed` here made clients retry immediately and then 409.
+    res.json(serializeOpsJob(jobManager.getJob(jobId) ?? job, 'analyze'));
   });
 
   // ── Embedding endpoints ────────────────────────────────────────────
@@ -1957,6 +2109,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           res.status(404).json({ error: 'Repository not found' });
           return;
         }
+
+        if (respondIfAnalysisPending(entry, res)) return;
 
         // Re-check the exact registered slot immediately before taking the lock.
         // The query resolver already validates it, but this closes the gap between
@@ -1994,10 +2148,38 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           // Set inside withLbugDb, read after it closes (#2790).
           let partialRunError: string | undefined;
           let partialRunDetail: AnalyzeJobPartialOutcome | undefined;
+          // The in-memory repo lock only serializes this server; a CLI analyze
+          // in another process guards the slot with the index lock, so hold it
+          // for the whole embedding write, released in the finally below.
+          let slotLock: IndexLockHandle | undefined;
           try {
+            slotLock = await acquireIndexLock(storagePath, { sweep: false });
+            requireExclusiveIndexLock(
+              slotLock,
+              `Cannot acquire the index lock at ${storagePath}; refusing an unlocked embedding run.`,
+            );
+            // This writer cannot recover staged generations. Preserve their
+            // receipts, including malformed ones, before sweeping or writing.
+            const recoveryCheckpoint = (await loadMeta(storagePath))?.embeddingCheckpoint;
+            if (recoveryCheckpoint && Object.hasOwn(recoveryCheckpoint, 'recovery')) {
+              throw new Error(
+                'Cannot generate embeddings: the index checkpoint references staged embeddings. ' +
+                  'Run `gitnexus analyze` to recover them first.',
+              );
+            }
+            sweepStagingArtifacts(storagePath);
+            // Writes go to the slot's own graph; a shared-store checkout
+            // reading an immutable commit graph (#3352) takes a private copy.
+            if (!(await ensurePrivateSharedGraph(storagePath, () => {}))) {
+              throw new Error('The shared graph this repository reads is gone. Re-run analyze.');
+            }
             const lbugPath = path.join(storagePath, LBUG_DIRECTORY);
             const ftsSession = await loadFtsSession(storagePath);
             let embeddingMeta = ftsSession.meta;
+            // Writable embed still replays a leftover FTS-abort WAL. Refuse
+            // here — doInitLbug only gates the readOnly path, and analyze
+            // writers must still be able to park/rebuild.
+            await assertReadOnlyFtsCrashSafe(lbugPath);
             await withLbugDb(
               lbugPath,
               async () => {
@@ -2224,6 +2406,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               });
             }
           } finally {
+            slotLock?.release();
             clearTimeout(embedTimeout);
             releaseRepoLock(repoLockPath);
           }
@@ -2248,18 +2431,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       res.status(404).json({ error: 'Job not found' });
       return;
     }
-    res.json({
-      id: job.id,
-      status: job.status,
-      repoName: job.repoName,
-      progress: job.progress,
-      error: job.error,
-      // Absent unless the run was a partial one — omitted by JSON.stringify, so
-      // the response shape is unchanged for every other outcome (#2790).
-      partial: job.partial,
-      startedAt: job.startedAt,
-      completedAt: job.completedAt,
-    });
+    res.json(serializeOpsJob(job, 'embed'));
   });
 
   // GET /api/embed/:jobId/progress — SSE stream (shared helper)
@@ -2278,7 +2450,59 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       return;
     }
     embedJobManager.cancelJob(jobId, 'Cancelled by user');
-    res.json({ id: job.id, status: 'failed', error: 'Cancelled by user' });
+    // Same live serialize as analyze DELETE / GET poll — do not invent `failed`.
+    res.json(serializeOpsJob(embedJobManager.getJob(jobId) ?? job, 'embed'));
+  });
+
+  const currentOpsSnapshot = () =>
+    buildOpsSnapshot({
+      analyzeJobs: jobManager.listJobs(),
+      embedJobs: embedJobManager.listJobs(),
+      serverStartedAt,
+      server: buildServerInfo(updateController.snapshot()),
+    });
+
+  // GET /api/ops — realtime execution snapshot for the ops dashboard.
+  // In-memory only (analyze + embed JobManagers); no git/fs work, safe to poll.
+  // Rate-limited: snapshot serialization is cheap per call but unbounded
+  // polling from many clients is not.
+  app.get('/api/ops', createRouteLimiter({ limit: 60 }), (_req, res) => {
+    res.json(currentOpsSnapshot());
+  });
+
+  // Cap concurrent ops SSE streams — each holds two intervals and serializes
+  // the full job list every second for as long as the client stays connected.
+  let opsStreamConnections = 0;
+  const MAX_OPS_STREAM_CONNECTIONS = 8;
+
+  // GET /api/ops/stream — SSE push of the same snapshot every second.
+  app.get('/api/ops/stream', createRouteLimiter({ limit: 30 }), (req, res) => {
+    if (opsStreamConnections >= MAX_OPS_STREAM_CONNECTIONS) {
+      res.status(429).json({ error: 'Too many ops stream connections' });
+      return;
+    }
+    opsStreamConnections += 1;
+
+    res.set({
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+    res.flushHeaders();
+
+    const push = () => {
+      res.write(`data: ${JSON.stringify(currentOpsSnapshot())}\n\n`);
+    };
+
+    push();
+    const interval = setInterval(push, 1_000);
+    const keepAlive = setInterval(() => res.write(':ping\n\n'), 15_000);
+    const release = () => {
+      clearInterval(interval);
+      clearInterval(keepAlive);
+      opsStreamConnections = Math.max(0, opsStreamConnections - 1);
+    };
+    req.on('close', release);
   });
 
   // ── Web UI (served at root) ───────────────────────────────────────
@@ -2292,8 +2516,19 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   const staticDir = await resolveWebDistDir(webDistDir, devWebDistDir);
   registerWebUI(app, staticDir);
 
-  // Global error handler — catch anything the route handlers miss
+  // Global error handler — catch anything the route handlers miss.
+  // body-parser rejections (malformed JSON → 400, > limit → 413, wrong
+  // charset → 415) arrive here as http-errors with a 4xx `status`/`statusCode`
+  // and `expose: true`; report them as the client errors they are instead of
+  // logging them at error level as a 500.
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const status = Number(err?.status ?? err?.statusCode);
+    if (Number.isInteger(status) && status >= 400 && status < 500) {
+      const message =
+        err?.expose && typeof err.message === 'string' && err.message ? err.message : 'Bad request';
+      res.status(status).json({ error: message });
+      return;
+    }
     logger.error({ err }, 'Unhandled error:');
     res.status(500).json({ error: 'Internal server error' });
   });

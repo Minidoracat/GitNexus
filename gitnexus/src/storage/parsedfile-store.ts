@@ -41,7 +41,7 @@
  * that gap we ALSO write the worker's ParsedFiles to a second, CONTENT-ADDRESSED
  * store keyed by the parse chunk hash (`getDurableParsedFileDir`), which mirrors
  * the parse cache's lifecycle (persists across runs, pruned by `usedKeys`,
- * version-tied via `PARSE_CACHE_VERSION`). On a warm hit the chunk's immutable
+ * bound to the resolved base parser identity). On a warm hit the chunk's immutable
  * durable shards are hardlinked (or atomically copied) into the run store after
  * their envelope metadata proves complete coverage. That pins a stable snapshot
  * before workers are skipped, even when another branch refreshes the shared
@@ -53,6 +53,7 @@ import path from 'node:path';
 import v8 from 'node:v8';
 import vm from 'node:vm';
 import type {
+  CallResultAssignmentSite,
   CallableFlowSite,
   ParsedFile,
   ReferenceSite,
@@ -352,20 +353,26 @@ export const loadParsedFilesForPaths = async (
           rejectedFiles++;
           continue;
         }
+        const assignments = sanitizeCallResultAssignmentSites(pf.callResultAssignmentSites);
+        if (assignments === undefined) {
+          rejectedFiles++;
+          continue;
+        }
         const chains = sanitizeReceiverChains(pf.referenceSites);
         if (chains === undefined) {
           rejectedFiles++;
           continue;
         }
-        if (flow.dropped === 0 && chains.dropped === 0) {
+        if (flow.dropped === 0 && assignments.dropped === 0 && chains.dropped === 0) {
           out.set(pf.filePath, pf);
         } else {
-          droppedSites += flow.dropped;
+          droppedSites += flow.dropped + assignments.dropped;
           droppedChains += chains.dropped;
           filesWithDroppedSites++;
           out.set(pf.filePath, {
             ...pf,
             ...(flow.dropped === 0 ? {} : { callableFlowSites: flow.sites }),
+            ...(assignments.dropped === 0 ? {} : { callResultAssignmentSites: assignments.sites }),
             ...(chains.dropped === 0 ? {} : { referenceSites: chains.sites }),
           });
         }
@@ -398,6 +405,19 @@ function sanitizeCallableFlowSites(
       ? value.slice(0, MAX_CALLABLE_FLOW_SITES_PER_FILE)
       : value;
   const sites = bounded.filter(isValidCallableFlowSite);
+  return { sites, dropped: value.length - sites.length };
+}
+
+function sanitizeCallResultAssignmentSites(
+  value: unknown,
+): { sites: readonly CallResultAssignmentSite[] | undefined; dropped: number } | undefined {
+  if (value === undefined) return { sites: undefined, dropped: 0 };
+  if (!Array.isArray(value)) return undefined;
+  const bounded =
+    value.length > MAX_CALLABLE_FLOW_SITES_PER_FILE
+      ? value.slice(0, MAX_CALLABLE_FLOW_SITES_PER_FILE)
+      : value;
+  const sites = bounded.filter(isValidCallResultAssignmentSite);
   return { sites, dropped: value.length - sites.length };
 }
 
@@ -501,6 +521,15 @@ function isValidCallableFlowSite(value: unknown): value is CallableFlowSite {
     default:
       return false;
   }
+}
+
+function isValidCallResultAssignmentSite(value: unknown): value is CallResultAssignmentSite {
+  return (
+    isRecord(value) &&
+    isValidRange(value.callSite) &&
+    isBoundedString(value.inScope) &&
+    isBoundedString(value.lhs)
+  );
 }
 
 function isValidOperand(value: unknown): boolean {
@@ -674,8 +703,9 @@ export const durableChunkHasShards = async (
   runStoragePath: string,
   chunkHash: string,
   expectedPaths: ReadonlySet<string>,
+  sourceStoragePath: string = runStoragePath,
 ): Promise<boolean> => {
-  const sourceDir = durableChunkDir(getDurableParsedFileDir(runStoragePath), chunkHash);
+  const sourceDir = durableChunkDir(getDurableParsedFileDir(sourceStoragePath), chunkHash);
   const shards = await listV8Shards(sourceDir);
   if (shards.length === 0 || expectedPaths.size === 0) return false;
 
@@ -843,10 +873,15 @@ export const mergeStagedDurableParsedFileStore = async (
   let stagedEntries: string[] = [];
   try {
     stagedEntries = await fs.readdir(stagedDir);
-  } catch {
+  } catch (err) {
+    // Only a missing staged store means there is no overlay. Other failures
+    // must preserve the old index's coverage instead of certifying partial
+    // live chunks whose staged repairs we could not enumerate.
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     await pruneAndSaveDurableParsedFileStore(liveDir, version, keepKeys);
     return;
   }
+  const publicationKeys = new Set(keepKeys);
   for (const name of stagedEntries) {
     if (name === DURABLE_INDEX_FILENAME) continue;
     const from = path.join(stagedDir, name);
@@ -859,6 +894,9 @@ export const mergeStagedDurableParsedFileStore = async (
     try {
       await replaceDurableChunkDir(from, to);
     } catch (err) {
+      // A surviving old directory may have incomplete coverage. Exclude it
+      // from the index even if pruning cannot remove it.
+      publicationKeys.delete(name);
       logger.warn(
         { err, entry: name },
         'parsedfile-cache: could not publish a staged durable chunk; ' +
@@ -866,7 +904,7 @@ export const mergeStagedDurableParsedFileStore = async (
       );
     }
   }
-  await pruneAndSaveDurableParsedFileStore(liveDir, version, keepKeys);
+  await pruneAndSaveDurableParsedFileStore(liveDir, version, publicationKeys);
 };
 
 /** Move `from` onto `to` without deleting `to` until the new tree is in place. */

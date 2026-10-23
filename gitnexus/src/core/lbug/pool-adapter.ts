@@ -30,9 +30,12 @@ import {
   WAL_RECOVERY_SUGGESTION,
 } from './lbug-config.js';
 import {
+  assertReadOnlyFtsCrashSafe,
+  FtsReaderUnrepairableError,
   guardWalQuarantine,
   isMissingFsError,
   isMissingShadowSidecarError,
+  isReadOnlyCheckpointInProgressError,
   isReadOnlyShadowReplayError,
   preflightLbugSidecars,
   quarantineWalForMissingShadow,
@@ -97,6 +100,12 @@ export function dbIdentityChanged(prev: DbIdentity | null, next: DbIdentity | nu
 }
 
 const pool = new Map<string, PoolEntry>();
+
+/** Identity of the native database currently serving this pool, not the path's latest file. */
+export function getLbugDbIdentity(repoId: string): DbIdentity | null {
+  const identity = pool.get(repoId)?.dbIdentity;
+  return identity ? { ...identity } : null;
+}
 
 /**
  * Listeners notified when a pool entry is torn down (LRU eviction, idle
@@ -566,6 +575,9 @@ async function tryQuarantineForMissingShadow(
   // refuseLargeWalQuarantine (issue #2382 review, Finding B). Kept OUTSIDE the
   // try so the actionable recovery message propagates to the MCP caller rather
   // than being re-wrapped as a rename failure.
+  // Never pass crash evidence: the pool is a reader/MCP surface and must
+  // keep today's large-WAL refusal (R9). Analyze parks via the dirty-recovery
+  // family before it opens.
   await guardWalQuarantine(dbPath, opts.reason, opts.err, poolSidecarLogger);
   try {
     const quarantinePath = await quarantineWalForMissingShadow(dbPath, {
@@ -605,12 +617,33 @@ async function probeDatabaseForShadowReplay(db: lbug.Database): Promise<void> {
 
 async function replayShadowPagesWithWritableOpen(dbPath: string): Promise<void> {
   let db: lbug.Database | undefined;
+  // Mirrors the direct adapter's `probeSucceeded` guard: once the probe has
+  // replayed, a MISSING-SHADOW error can only come from the CHECKPOINT itself
+  // — quarantining the WAL then would park a live sidecar on a db whose main
+  // file just changed underneath it. Fail closed instead (review finding:
+  // policy drift vs the serve path).
+  let replaySucceeded = false;
   try {
     db = createLbugDatabase(lbug, toNativeSafePath(dbPath), { throwOnWalReplayFailure: false });
     await db.init();
     await probeDatabaseForShadowReplay(db);
+    replaySucceeded = true;
+    // Load-bearing durability step (engine 0.19.1 matrix, homelab repro
+    // 2026-09-19): the probe replays the WAL in MEMORY only. Without an
+    // explicit CHECKPOINT the engine drops those pages at close and the
+    // follow-up read-only open silently serves the pre-checkpoint state.
+    const conn = createConnection(db);
+    try {
+      const checkpointResult = await conn.query('CHECKPOINT');
+      const result = Array.isArray(checkpointResult) ? checkpointResult[0] : checkpointResult;
+      await result.getAll();
+      // Shared best-effort closer (awaits + swallows) — never roll this loop.
+      await closeQueryResults(result);
+    } finally {
+      await conn.close().catch(() => {});
+    }
   } catch (err) {
-    if (isMissingShadowSidecarError(err)) {
+    if (isMissingShadowSidecarError(err) && !replaySucceeded) {
       await tryQuarantineForMissingShadow(dbPath, {
         reason: 'pool writable replay recovery',
         err,
@@ -627,6 +660,7 @@ async function openReadOnlyDatabase(dbPath: string): Promise<lbug.Database> {
   let db: lbug.Database | undefined;
   silenceStdout();
   try {
+    await assertReadOnlyFtsCrashSafe(dbPath);
     await preflightLbugSidecars(dbPath, {
       mode: 'read-only',
       logger: poolSidecarLogger,
@@ -636,8 +670,14 @@ async function openReadOnlyDatabase(dbPath: string): Promise<lbug.Database> {
       readOnly: true,
       throwOnWalReplayFailure: false,
     });
-    await db.init();
+    // init() is inside the try: an interrupted checkpoint (pod killed
+    // mid-CHECKPOINT leaves `lbug.wal` + `lbug.shadow`) can make the read-only
+    // OPEN itself refuse — "Cannot open database in read-only mode while
+    // checkpoint is in progress" — before any probe runs (homelab repro
+    // 2026-09-19). Both refusal classes recover identically below: one
+    // writable open replays the WAL/completes the checkpoint.
     try {
+      await db.init();
       await probeDatabaseForShadowReplay(db);
     } catch (err) {
       if (isMissingShadowSidecarError(err)) {
@@ -660,7 +700,7 @@ async function openReadOnlyDatabase(dbPath: string): Promise<lbug.Database> {
         await probeDatabaseForShadowReplay(db);
         return db;
       }
-      if (!isReadOnlyShadowReplayError(err)) {
+      if (!isReadOnlyShadowReplayError(err) && !isReadOnlyCheckpointInProgressError(err)) {
         throw err;
       }
       await db.close().catch(() => {});
@@ -779,6 +819,14 @@ const initLbugInner = async (repoId: string, dbPath: string): Promise<InitLbugAt
     // freshness THROUGH initLbug (rather than calling closeLbug directly) get
     // this guard for free; that is why LocalBackend delegates here (#2614).
     if (existing.checkedOut > 0) return { status: 'done', reopened: false };
+    // Closing only this consumer would leave the shared native handle alive
+    // and doInitLbug would attach eight new connections to that same old
+    // generation. Keep this pool intact until the other consumers release it;
+    // its opened identity stays divergent so the next init can retry then.
+    const shared = dbCache.get(existing.dbPath);
+    if (shared && shared.db === existing.db && shared.refCount > 1) {
+      return { status: 'done', reopened: false };
+    }
     // Awaited: see the rationale on the evictLRU call site in doInitLbug below.
     await closeOne(repoId); // idle & changed → evict, then fall through to reopen the new file
   }
@@ -855,6 +903,9 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<InitLbugAttem
       // Not retryable: the on-disk file's storage version doesn't change
       // on its own. Fail immediately with an actionable message.
       throwIfStorageVersionMismatch(lastError);
+      if (lastError instanceof FtsReaderUnrepairableError) {
+        throw lastError;
+      }
 
       if (isWalCorruptionError(lastError)) {
         try {
@@ -922,9 +973,9 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<InitLbugAttem
   // Register pool entry only after all connections are pre-warmed and FTS is
   // loaded.  Concurrent executeQuery calls see either "not initialized"
   // (and throw cleanly) or a fully ready pool — never a half-built one.
-  // Record the on-disk identity so a later initLbug can detect an analyze
-  // rebuild/mutation and re-open onto the new file (pool staleness invalidation).
-  const dbIdentity = await statDbIdentity(dbPath);
+  // Keep the opened SharedDB identity: another consumer may still hold an
+  // older native handle after the file at dbPath has been replaced.
+  const dbIdentity = shared.dbIdentity ?? null;
   pool.set(repoId, {
     db,
     available,
