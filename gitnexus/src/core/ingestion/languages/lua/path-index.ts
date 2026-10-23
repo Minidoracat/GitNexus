@@ -12,6 +12,10 @@
  *                                        the target file's `return` keys
  *   `@12:4`    local function value    → the caller file's def at 12:4
  *
+ * A global or local key no def is keyed under is retried through a top-level
+ * path alias on it or on its longest aliased prefix (`Panel.f = Layout.f`
+ * makes `Panel.f` name `Layout.f`), from the aliasing file's point of view.
+ *
  * Resolution returns every candidate; callers act only on exactly one, so a
  * path defined twice (two files, two conditional branches) stays unresolved.
  */
@@ -35,16 +39,27 @@ interface LuaFilePathIndex {
   readonly returnFieldKeys: Readonly<Record<string, readonly string[]>>;
 }
 
+interface LuaAlias {
+  /** The aliasing file: `to`'s `#` / `@` / `~` keys resolve from there. */
+  readonly filePath: string;
+  readonly to: readonly string[];
+}
+
 export interface LuaPathIndex {
   /** Callable defs (table members, global functions) by key. */
   readonly callables: LuaKeyTable;
   /** Factory classes (`X = Base:derive("X")`) by key. */
   readonly classes: LuaKeyTable;
+  /** Top-level path aliases by assigned key: global, and `#…` per file. */
+  readonly aliases: {
+    readonly global: ReadonlyMap<string, readonly LuaAlias[]>;
+    readonly local: ReadonlyMap<string, ReadonlyMap<string, readonly LuaAlias[]>>;
+  };
   readonly files: ReadonlyMap<string, LuaFilePathIndex>;
 }
 
-/** Bound on require-root hops (`~a.b` → a file returning `~c` → …). */
-const MAX_REQUIRE_HOPS = 8;
+/** Bound on indirections (`~a.b` → a file returning `~c` → …, alias → alias → …). */
+const MAX_PATH_HOPS = 8;
 
 function addKeys(
   facts: readonly LuaDefKeys[],
@@ -72,6 +87,10 @@ function addKeys(
 export function buildLuaPathIndex(parsedFiles: readonly ParsedFile[]): LuaPathIndex {
   const callables = { global: new Map(), local: new Map() };
   const classes = { global: new Map(), local: new Map() };
+  const aliases = {
+    global: new Map<string, LuaAlias[]>(),
+    local: new Map<string, Map<string, LuaAlias[]>>(),
+  };
   const files = new Map<string, LuaFilePathIndex>();
   for (const parsed of parsedFiles) {
     const defsByPosition = new Map<string, SymbolDefinition>();
@@ -87,6 +106,16 @@ export function buildLuaPathIndex(parsedFiles: readonly ParsedFile[]): LuaPathIn
     const lua = channel?.kind === 'lua' ? channel : undefined;
     addKeys(lua?.defKeys ?? [], parsed, defsByPosition, callables.global, callables.local);
     addKeys(lua?.classKeys ?? [], parsed, defsByPosition, classes.global, classes.local);
+    for (const { keys, to } of lua?.aliasKeys ?? []) {
+      for (const key of keys) {
+        let bucket = aliases.global;
+        if (key.startsWith('#')) {
+          bucket = aliases.local.get(parsed.filePath) ?? new Map();
+          aliases.local.set(parsed.filePath, bucket);
+        }
+        bucket.set(key, [...(bucket.get(key) ?? []), { filePath: parsed.filePath, to }]);
+      }
+    }
     files.set(parsed.filePath, {
       parsed,
       defsByPosition,
@@ -94,7 +123,7 @@ export function buildLuaPathIndex(parsedFiles: readonly ParsedFile[]): LuaPathIn
       returnFieldKeys: lua?.returnFieldKeys ?? {},
     });
   }
-  return { callables, classes, files };
+  return { callables, classes, aliases, files };
 }
 
 /** Every def `key` names in `table`, from `filePath`'s point of view (deduplicated). */
@@ -112,11 +141,13 @@ export function resolveLuaPathKey(
     const def = file.defsByPosition.get(key.slice(1));
     return def === undefined ? [] : [def];
   }
-  if (key.startsWith('#')) return table.local.get(filePath)?.get(key) ?? [];
-  if (!key.startsWith('~')) return table.global.get(key) ?? [];
+  if (!key.startsWith('~')) {
+    const defs = (key.startsWith('#') ? table.local.get(filePath) : table.global)?.get(key) ?? [];
+    return defs.length > 0 ? defs : resolveLuaAlias(index, table, filePath, key, scopes, hops);
+  }
 
   // `~util.f`: the file bound to `local util = require …`, then what it returns.
-  if (hops >= MAX_REQUIRE_HOPS) return [];
+  if (hops >= MAX_PATH_HOPS) return [];
   const [root, ...fields] = key.slice(1).split('.');
   const edges = (scopes.imports.get(file.parsed.moduleScope) ?? []).filter(
     (edge) => edge.localName === root && edge.targetFile !== null,
@@ -136,6 +167,37 @@ export function resolveLuaPathKey(
     resolveLuaPathKey(index, table, target.parsed.filePath, candidate, scopes, hops + 1),
   );
   return [...new Set(candidates)];
+}
+
+/** `key` through the alias on it or on its longest aliased prefix (`Panel.f` → `Layout.f`). */
+function resolveLuaAlias(
+  index: LuaPathIndex,
+  table: LuaKeyTable,
+  filePath: string,
+  key: string,
+  scopes: ScopeResolutionIndexes,
+  hops: number,
+): readonly SymbolDefinition[] {
+  if (hops >= MAX_PATH_HOPS) return [];
+  const parts = key.split('.');
+  for (let cut = parts.length; cut > 0; cut--) {
+    const prefix = parts.slice(0, cut).join('.');
+    const aliases = prefix.startsWith('#')
+      ? index.aliases.local.get(filePath)?.get(prefix)
+      : index.aliases.global.get(prefix);
+    if (aliases === undefined) continue;
+    const rest = parts
+      .slice(cut)
+      .map((part) => `.${part}`)
+      .join('');
+    const defs = aliases.flatMap((alias) =>
+      alias.to.flatMap((to) =>
+        resolveLuaPathKey(index, table, alias.filePath, to + rest, scopes, hops + 1),
+      ),
+    );
+    return [...new Set(defs)];
+  }
+  return [];
 }
 
 /**

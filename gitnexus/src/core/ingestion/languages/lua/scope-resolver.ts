@@ -21,6 +21,7 @@ import type { GraphNodeLookup } from '../../scope-resolution/graph-bridge/node-l
 import { tryEmitEdge } from '../../scope-resolution/graph-bridge/edges.js';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
 import { buildSuffixIndex, suffixResolve, type SuffixIndex } from '../../utils/suffix-index.js';
+import { isTestFilePath } from '../../utils/test-file-path.js';
 import type { ScopeResolver } from '../../scope-resolution/contract/scope-resolver.js';
 import { buildMro, defaultLinearize } from '../../scope-resolution/passes/mro.js';
 import { luaProvider } from '../lua.js';
@@ -149,6 +150,12 @@ function resolveLuaNamespaceMember(
 // do not receive the file set themselves.
 let luaPathIndex: LuaPathIndex | undefined;
 
+/** A test file's def is no target for production code: `smoke_harness.lua`
+ *  redefines engine globals (`isClient`, `require`) as test doubles. */
+function isTestDoubleFor(callerFile: string, def: SymbolDefinition): boolean {
+  return isTestFilePath(def.filePath) && !isTestFilePath(callerFile);
+}
+
 /** The single def a site's path key names, or undefined when none or several. */
 function resolveLuaPathSite(
   filePath: string,
@@ -157,7 +164,8 @@ function resolveLuaPathSite(
 ): SymbolDefinition | undefined {
   if (key === undefined || luaPathIndex === undefined) return undefined;
   const defs = resolveLuaPathKey(luaPathIndex, luaPathIndex.callables, filePath, key, scopes);
-  return defs.length === 1 ? defs[0] : undefined;
+  const targets = defs.filter((def) => !isTestDoubleFor(filePath, def));
+  return targets.length === 1 ? targets[0] : undefined;
 }
 
 /**
@@ -198,6 +206,44 @@ function emitLuaTablePathEdges(
       if (
         target !== undefined &&
         tryEmitEdge(graph, scopes, nodeLookup, site, target, 'lua-table-path', seen, 0.85)
+      ) {
+        emitted++;
+      }
+    }
+  }
+  return emitted;
+}
+
+/**
+ * `Events.X.Add(f)`, `pcall(f, …)` and `xpcall(f, h)` hand `f` to the engine,
+ * which calls it: emit CALLS from the registering site's caller to `f`
+ * (reason `lua-callback`), so `impact(f)` lists who registered it. The
+ * registering call's own reference site supplies the caller scope.
+ */
+function emitLuaCallbackEdges(
+  graph: KnowledgeGraph,
+  scopes: ScopeResolutionIndexes,
+  parsedFiles: readonly ParsedFile[],
+  nodeLookup: GraphNodeLookup,
+): number {
+  const seen = new Set<string>();
+  let emitted = 0;
+  for (const parsed of parsedFiles) {
+    const channel = parsed.captureSideChannel as LuaCaptureSideChannel | undefined;
+    const callbacks = channel?.kind === 'lua' ? (channel.callbackKeys ?? []) : [];
+    if (callbacks.length === 0) continue;
+    const callSites = new Map(
+      parsed.referenceSites
+        .filter((site) => site.kind === 'call')
+        .map((site) => [`${site.atRange.startLine}:${site.atRange.startCol}`, site]),
+    );
+    for (const { line, col, key } of callbacks) {
+      const site = callSites.get(`${line}:${col}`);
+      const target = resolveLuaPathSite(parsed.filePath, key, scopes);
+      if (
+        site !== undefined &&
+        target !== undefined &&
+        tryEmitEdge(graph, scopes, nodeLookup, site, target, 'lua-callback', seen, 0.8)
       ) {
         emitted++;
       }
@@ -292,7 +338,9 @@ const luaScopeResolver: ScopeResolver = {
   allowGlobalFreeCallFallback: true,
   isFileLocalDef: (def) => def.isExported === false,
   isGlobalNameFallbackPlausible: ({ callerParsed, candidate, site }) =>
-    candidate.isExported !== false && !localOnlyCalleesOf(callerParsed).has(site.name),
+    candidate.isExported !== false &&
+    !localOnlyCalleesOf(callerParsed).has(site.name) &&
+    !isTestDoubleFor(callerParsed.filePath, candidate),
 
   // A bare call to a Lua global (`foo()` with no visible `local foo`) is a
   // lookup in the one global table: resolve it through the workspace path
@@ -306,7 +354,9 @@ const luaScopeResolver: ScopeResolver = {
       : resolveLuaPathSite(callerParsed.filePath, key, scopes);
   },
 
-  emitUnresolvedReceiverEdges: emitLuaTablePathEdges,
+  emitUnresolvedReceiverEdges: (graph, scopes, parsedFiles, nodeLookup, handledSites) =>
+    emitLuaTablePathEdges(graph, scopes, parsedFiles, nodeLookup, handledSites) +
+    emitLuaCallbackEdges(graph, scopes, parsedFiles, nodeLookup),
 };
 
 export { luaScopeResolver };

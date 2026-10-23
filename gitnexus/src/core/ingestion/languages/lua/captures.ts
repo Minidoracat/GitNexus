@@ -37,6 +37,7 @@ import {
   collectLuaPathFacts,
   isLuaRequireCall,
   isNestedInLuaFunction,
+  luaFieldChild,
   simpleVariableName,
   type LuaLexicalFacts,
 } from './path-env.js';
@@ -303,7 +304,7 @@ function collectLuaAssignedFunctionCaptures(
           continue;
         }
         const owner = variable.childForFieldName('table');
-        const method = variable.childForFieldName('field');
+        const method = luaFieldChild(variable);
         if (owner === null || (method?.type !== 'identifier' && method?.type !== 'string')) {
           continue;
         }
@@ -343,8 +344,16 @@ function markLuaTableMember(
     nameNode,
     dotted,
   );
-  match['@declaration.binding-name'] = syntheticCapture('@declaration.binding-name', nameNode, dotted);
-  match['@declaration.is-exported'] = syntheticCapture('@declaration.is-exported', nameNode, 'false');
+  match['@declaration.binding-name'] = syntheticCapture(
+    '@declaration.binding-name',
+    nameNode,
+    dotted,
+  );
+  match['@declaration.is-exported'] = syntheticCapture(
+    '@declaration.is-exported',
+    nameNode,
+    'false',
+  );
 }
 
 function addLuaArityCaptures(
@@ -467,7 +476,11 @@ export function emitLuaScopeCaptures(
     out.push({
       '@declaration.class': nodeToCapture('@declaration.class', statement),
       '@declaration.name': nodeToCapture('@declaration.name', name),
-      '@declaration.is-exported': syntheticCapture('@declaration.is-exported', name, String(!isLocal)),
+      '@declaration.is-exported': syntheticCapture(
+        '@declaration.is-exported',
+        name,
+        String(!isLocal),
+      ),
     });
   }
   // `self` inside `function X:m()` is an `X` (anchored on the body so the
@@ -499,7 +512,8 @@ export function emitLuaScopeCaptures(
     }
   }
   for (const { name, parentText, parentKeys } of facts.factoryClasses) {
-    if (parentText.length > 0) extendsPairs.push({ child: name.text, parent: parentText, parentKeys });
+    if (parentText.length > 0)
+      extendsPairs.push({ child: name.text, parent: parentText, parentKeys });
   }
   const methodOwners: LuaMethodOwnerPair[] = [];
   for (const m of getMethodOwnerQuery().matches(tree.rootNode)) {
@@ -527,7 +541,7 @@ export function emitLuaScopeCaptures(
     classNames.has(name),
   );
   const returnedFields = collectLuaReturnedFields(tree.rootNode);
-  const { localOnlyCallees, defKeys, classKeys, returnKeys } = facts;
+  const { localOnlyCallees, defKeys, classKeys, returnKeys, aliasKeys, callbackKeys } = facts;
   const returnFieldKeys = facts.returnFields;
   if (
     extendsPairs.length > 0 ||
@@ -538,7 +552,9 @@ export function emitLuaScopeCaptures(
     defKeys.length > 0 ||
     classKeys.length > 0 ||
     returnKeys.length > 0 ||
-    Object.keys(returnFieldKeys).length > 0
+    Object.keys(returnFieldKeys).length > 0 ||
+    aliasKeys.length > 0 ||
+    callbackKeys.length > 0
   ) {
     setLuaHeritageFacts(filePath, {
       kind: 'lua',
@@ -551,6 +567,8 @@ export function emitLuaScopeCaptures(
       classKeys,
       returnKeys,
       returnFieldKeys,
+      aliasKeys,
+      callbackKeys,
     });
   } else {
     // Re-capture produced no heritage — drop any prior facts for this file so

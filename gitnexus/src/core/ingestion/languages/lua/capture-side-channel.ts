@@ -9,7 +9,7 @@
  * `emitScopeCaptures` populates this map as a side effect, then
  * `LanguageProvider.collectCaptureSideChannel` snapshots it per file.
  */
-import type { LuaDefKeys } from './path-env.js';
+import type { LuaAliasKeys, LuaCallbackKey, LuaDefKeys } from './path-env.js';
 
 export interface LuaExtendsPair {
   /** Child class name (quotes stripped from `class("Name", ...)`; the bound
@@ -57,6 +57,10 @@ export interface LuaCaptureSideChannel {
   readonly returnKeys: readonly string[];
   /** Keys per field when the chunk returns a table constructor (`return { f = f }`). */
   readonly returnFieldKeys: Readonly<Record<string, readonly string[]>>;
+  /** Top-level path aliases (`T.f = U.g`), followed when a key has no def of its own. */
+  readonly aliasKeys: readonly LuaAliasKeys[];
+  /** Functions registered for the engine to call, by the registering call's anchor. */
+  readonly callbackKeys: readonly LuaCallbackKey[];
   /**
    * Names whose every bare call in this file resolves to a lexical `local`
    * (see `path-env.ts`). A workspace-wide name guess for such a call is

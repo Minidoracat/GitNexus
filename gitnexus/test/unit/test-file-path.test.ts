@@ -48,6 +48,16 @@ describe('isTestFilePath — shared predicate', () => {
     });
   }
 
+  it('detects the in-game smoke harness, not files that only share its stem', () => {
+    expect(isTestFilePath('Contents/mods/M/42/media/lua/client/M/smoke_harness.lua')).toBe(true);
+    expect(isTestFilePath('Contents\\mods\\M\\42\\media\\lua\\client\\M\\Smoke_Harness.lua')).toBe(
+      true,
+    );
+    expect(isTestFilePath('Contents/mods/M/42/media/lua/client/M/smoke_harness_ui.lua')).toBe(
+      false,
+    );
+  });
+
   for (const p of [
     'src/app/widgets.ts',
     'src/core/ingestion/utils/test-file-path.ts',

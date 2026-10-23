@@ -48,6 +48,9 @@ const TEST_PATH_SUBSTRINGS: readonly string[] = [
   '.integrationtests/',
   '.unittests/',
   '/testproject/',
+  // Project Zomboid mods ship their in-game E2E driver as `smoke_harness.lua`
+  // beside the code it drives.
+  '/smoke_harness.',
 ];
 
 /** Case-insensitive suffixes that already include a delimiter (`_test.py`, not `test.py`). */

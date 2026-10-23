@@ -1453,3 +1453,119 @@ function ChainButton:render() end
     );
   }, 60000);
 });
+
+// ---------------------------------------------------------------------------
+// Idioms of the Project Zomboid mods this resolver is tuned on: guarded
+// aliases, multi-level global paths, method aliases between tables, and
+// functions handed to the engine as callbacks.
+// ---------------------------------------------------------------------------
+
+describe('Lua scope: guarded aliases, method aliases and callbacks', () => {
+  let result: PipelineResult;
+  let tmpDir: string;
+
+  beforeAll(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lua-scope-idioms-'));
+    writeFixtureRepo(tmpDir, {
+      'm/media/lua/shared/defs.lua': `EC = EC or {}
+EC.Mailbox = EC.Mailbox or {}
+function EC.Mailbox.hasFreeSlot(p) return p ~= nil end
+Layout = Layout or {}
+function Layout.place(self) return self end
+local function helper() end
+EC.Mailbox.helper = helper
+Loop = Loop or {}
+Loop.a = Loop.b
+Loop.b = Loop.a
+`,
+      'm/media/lua/client/callers.lua': `local M = EC and EC.Mailbox
+local N = EC and EC.Mailbox or {}
+local R = Other and EC.Mailbox
+function useGuarded() return M.hasFreeSlot(1) end
+function useGuardedOr() return N.hasFreeSlot(2) end
+function useUnrelatedGuard() return R.hasFreeSlot(3) end
+function useDirect() return EC.Mailbox.hasFreeSlot(4) end
+function useLoop() return Loop.a() end
+function useHelper() return EC.Mailbox.helper() end
+local function onTick() end
+Events.OnTick.Add(onTick)
+Events.OnGameStart.Add(EC.Mailbox.hasFreeSlot)
+Events.OnTick.Remove(onTick)
+Events.OnTick.Add(function() end)
+function safe() return pcall(EC.Mailbox.hasFreeSlot, 5) end
+function safeLocal() return xpcall(onTick, print) end
+`,
+      'm/media/lua/client/panel.lua': `Panel = ISPanel:derive("Panel")
+Panel.place = Layout.place
+function Panel:render() self:place() end
+function drawPanel(p) Panel.place(p) end
+`,
+    });
+    result = await runPipelineFromRepo(tmpDir, () => {});
+  }, 60000);
+
+  afterAll(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('resolves a guarded alias `A and A.B`, also under `or {}`', () => {
+    expect(callsBetween(result, 'useGuarded', 'hasFreeSlot')).toEqual([
+      'useGuarded -> hasFreeSlot@defs.lua',
+    ]);
+    expect(callsBetween(result, 'useGuardedOr', 'hasFreeSlot')).toEqual([
+      'useGuardedOr -> hasFreeSlot@defs.lua',
+    ]);
+  });
+
+  it('leaves `A and B.C` unresolved when B.C does not extend A', () => {
+    expect(callsBetween(result, 'useUnrelatedGuard', 'hasFreeSlot')).toEqual([]);
+  });
+
+  it('resolves a call written as a multi-level global path', () => {
+    expect(callsBetween(result, 'useDirect', 'hasFreeSlot')).toEqual([
+      'useDirect -> hasFreeSlot@defs.lua',
+    ]);
+  });
+
+  it('follows a method alias `T.f = U.f` for direct and self calls', () => {
+    expect(callsBetween(result, 'drawPanel', 'place')).toEqual(['drawPanel -> place@defs.lua']);
+    expect(callsBetween(result, 'render', 'place')).toEqual(['render -> place@defs.lua']);
+  });
+
+  it("resolves an alias to a local function from the aliasing file's point of view", () => {
+    expect(callsBetween(result, 'useHelper', 'helper')).toEqual(['useHelper -> helper@defs.lua']);
+  });
+
+  it('stops on an alias cycle', () => {
+    expect(getRelationships(result, 'CALLS').filter((e) => e.source === 'useLoop')).toEqual([]);
+  });
+
+  it('emits lua-callback CALLS for event registration, pcall and xpcall arguments', () => {
+    const callbacks = getRelationships(result, 'CALLS')
+      .filter((e) => e.rel.reason === 'lua-callback')
+      .map((e) => `${e.source} -> ${e.target}@${path.basename(e.targetFilePath)}`)
+      .sort();
+    expect(callbacks).toEqual([
+      'callers.lua -> hasFreeSlot@defs.lua',
+      'callers.lua -> onTick@callers.lua',
+      'safe -> hasFreeSlot@defs.lua',
+      'safeLocal -> onTick@callers.lua',
+    ]);
+  });
+  it("never resolves production code into the smoke harness's test doubles", async () => {
+    await withLuaFixture(
+      {
+        'm/media/lua/client/M/smoke_harness.lua': `function isClient() return true end
+function runSmoke() return Mod.open() end
+`,
+        'm/media/lua/client/M/mod.lua': `Mod = Mod or {}
+function Mod.open() if isClient() then return pcall(isClient) end end
+`,
+      },
+      (result) => {
+        expect(callsBetween(result, 'open', 'isClient')).toEqual([]);
+        expect(callsBetween(result, 'runSmoke', 'open')).toEqual(['runSmoke -> open@mod.lua']);
+      },
+    );
+  }, 60000);
+});

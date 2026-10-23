@@ -69,6 +69,23 @@ export interface LuaDefKeys {
   readonly keys: readonly string[];
 }
 
+/** A top-level path assignment (`T.f = U.g`): `keys` name whatever `to` names. */
+export interface LuaAliasKeys {
+  /** Keys of the assigned path. */
+  readonly keys: readonly string[];
+  /** Keys of the assigned value. */
+  readonly to: readonly string[];
+}
+
+/** A function handed to the engine to call: `Events.X.Add(f)`, `pcall(f, …)`, `xpcall(f, h)`. */
+export interface LuaCallbackKey {
+  /** The registering call's anchor (its reference site): 1-based line, 0-based column. */
+  readonly line: number;
+  readonly col: number;
+  /** Path key of the registered function. */
+  readonly key: string;
+}
+
 export interface LuaLexicalFacts {
   readonly localIdentifierStarts: ReadonlySet<number>;
   readonly localOnlyCallees: readonly string[];
@@ -100,6 +117,8 @@ export interface LuaPathFacts extends LuaLexicalFacts {
   readonly selfTypes: ReadonlyMap<SyntaxNode, string>;
   /** Call node `startIndex:endIndex` → the path key the callee names. */
   readonly callKeys: ReadonlyMap<string, string>;
+  readonly aliasKeys: readonly LuaAliasKeys[];
+  readonly callbackKeys: readonly LuaCallbackKey[];
   readonly returnKeys: readonly string[];
   readonly returnFields: Readonly<Record<string, readonly string[]>>;
 }
@@ -152,12 +171,23 @@ function childOfType(node: SyntaxNode, type: string): SyntaxNode | undefined {
 /** `require "m"` / `require("m")` / `require [[m]]`. */
 export function isLuaRequireCall(node: SyntaxNode): boolean {
   return (
-    node.type === 'call' && simpleVariableName(node.childForFieldName('function'))?.text === 'require'
+    node.type === 'call' &&
+    simpleVariableName(node.childForFieldName('function'))?.text === 'require'
   );
 }
 
 function position(node: SyntaxNode): { line: number; col: number } {
   return { line: node.startPosition.row + 1, col: node.startPosition.column };
+}
+
+/**
+ * The `field` child of a `variable` (`c` in `A.B.c`). Not `childForFieldName`:
+ * on a nested path it can return the inner variable's field (`B`) — 14,264 of
+ * Economy's 390,523 variables under tree-sitter 0.25.1. `childrenForFieldName`
+ * reads direct children only.
+ */
+export function luaFieldChild(variable: SyntaxNode): SyntaxNode | null {
+  return variable.childrenForFieldName('field')[0] ?? null;
 }
 
 /** Static field name of `T.f` / `T["f"]`; undefined for a computed key. */
@@ -197,7 +227,9 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
   const tableIds = new Map<number, number>();
   const memberDefs: MemberDefFact[] = [];
   const globalDefs: { anchor: SyntaxNode; name: string }[] = [];
-  const registrations: { target: Sym; value: Sym }[] = [];
+  /** `alias`: a top-level non-function value, which may name a function (`T.f = U.g`). */
+  const registrations: { target: Sym; value: Sym; alias: boolean }[] = [];
+  const callbacks: { anchor: SyntaxNode; arg: Sym; aliasLine: number | undefined }[] = [];
   const calls = new Map<string, CallFact>();
   let returnSym: Sym | undefined;
   const returnFieldSyms = new Map<string, Sym>();
@@ -208,8 +240,11 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
     readonly isLocal: boolean;
     readonly tableId: number;
   }[] = [];
-  const colonMethods: { readonly body: SyntaxNode; readonly owner: SyntaxNode; readonly sym: Sym }[] =
-    [];
+  const colonMethods: {
+    readonly body: SyntaxNode;
+    readonly owner: SyntaxNode;
+    readonly sym: Sym;
+  }[] = [];
 
   const tableIdAt = (node: SyntaxNode): number => {
     let id = tableIds.get(node.startIndex);
@@ -246,16 +281,22 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
       case 'variable': {
         const table = node.childForFieldName('table');
         if (table === null || node.childForFieldName('method') !== null) return OPAQUE;
-        return withField(symOf(table, env), fieldName(node.childForFieldName('field')));
+        return withField(symOf(table, env), fieldName(luaFieldChild(node)));
       }
       case 'parenthesized_expression':
         return symOf(node.namedChildren[0], env);
-      case 'binary_expression':
+      case 'binary_expression': {
+        const operator = node.childForFieldName('operator')?.type;
+        const right = node.childForFieldName('right');
         // `X = X or {}` — the namespace idiom names the left operand.
-        return node.childForFieldName('operator')?.type === 'or' &&
-          node.childForFieldName('right')?.type === 'table'
-          ? symOf(node.childForFieldName('left'), env)
-          : OPAQUE;
+        if (operator === 'or' && right?.type === 'table') {
+          return symOf(node.childForFieldName('left'), env);
+        }
+        // `A and A.B` — a nil-guarded read names the path it reads.
+        if (operator !== 'and') return OPAQUE;
+        const value = symOf(right, env);
+        return isGuardedRead(symOf(node.childForFieldName('left'), env), value) ? value : OPAQUE;
+      }
       case 'table':
         return { kind: 'table', id: tableIdAt(node), fields: [] };
       case 'call': {
@@ -273,6 +314,26 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
       default:
         return OPAQUE;
     }
+  };
+
+  /** The function argument of `Events.X.Add(f)`, `pcall(f, …)` or `xpcall(f, h)`. */
+  const registeredCallback = (call: SyntaxNode, env: Env): SyntaxNode | undefined => {
+    const callee = call.childForFieldName('function');
+    if (callee?.type !== 'variable' && callee?.type !== 'identifier') return undefined;
+    const sym = symOf(callee, env);
+    if (sym.kind !== 'global') return undefined;
+    const registers =
+      sym.fields.length === 0
+        ? sym.name === 'pcall' || sym.name === 'xpcall'
+        : sym.name === 'Events' && sym.fields.length === 2 && sym.fields[1] === 'Add';
+    if (!registers) return undefined;
+    const argumentList = call.childForFieldName('arguments');
+    const first =
+      argumentList === null
+        ? undefined
+        : childOfType(argumentList, 'expression_list')?.namedChildren[0];
+    // An inline `function() … end` is no named target; its own calls are captured where they are.
+    return first?.type === 'function_definition' ? undefined : first;
   };
 
   /** Values of `lhs1, lhs2 = e1, e2` by position; a missing value is `nil`
@@ -358,8 +419,7 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
           }
         } else if (name !== null) {
           const owner = symOf(name.childForFieldName('table'), env);
-          const member =
-            name.childForFieldName('method')?.text ?? fieldName(name.childForFieldName('field'));
+          const member = name.childForFieldName('method')?.text ?? fieldName(luaFieldChild(name));
           if (member !== undefined && !isNestedInLuaFunction(node)) {
             memberDefs.push({ anchor: node, owner, member });
           }
@@ -410,16 +470,25 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
               decl.values.push(value);
               return;
             }
-            if (isFunctionValue && topLevel) globalDefs.push({ anchor: valueNode, name: name.text });
-            registrations.push({ target: symOf(target, env), value });
+            if (isFunctionValue && topLevel)
+              globalDefs.push({ anchor: valueNode, name: name.text });
+            registrations.push({
+              target: symOf(target, env),
+              value,
+              alias: topLevel && !isFunctionValue,
+            });
             return;
           }
           const table = target.childForFieldName('table');
-          const member = fieldName(target.childForFieldName('field'));
+          const member = fieldName(luaFieldChild(target));
           if (table !== null && member !== undefined && isFunctionValue && topLevel) {
             memberDefs.push({ anchor: valueNode, owner: symOf(table, env), member });
           }
-          registrations.push({ target: symOf(target, env), value });
+          registrations.push({
+            target: symOf(target, env),
+            value,
+            alias: topLevel && !isFunctionValue,
+          });
           visit(target, env);
         });
         return;
@@ -475,11 +544,19 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
         } else if (callee?.type === 'variable') {
           const table = callee.childForFieldName('table');
           const member =
-            callee.childForFieldName('method')?.text ??
-            fieldName(callee.childForFieldName('field'));
+            callee.childForFieldName('method')?.text ?? fieldName(luaFieldChild(callee));
           if (table !== null && member !== undefined) {
             calls.set(callKey, { kind: 'member', owner: symOf(table, env), member });
           }
+        }
+        const callback = registeredCallback(node, env);
+        if (callback !== undefined) {
+          const argName = simpleVariableName(callback);
+          callbacks.push({
+            anchor: node,
+            arg: symOf(callback, env),
+            aliasLine: argName === undefined ? undefined : env.lookup(argName.text)?.line,
+          });
         }
         visitChildren(node, env);
         return;
@@ -631,6 +708,19 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
     }
   }
 
+  /** The one key a site carries; `aliasLine` is the line of the local it reads through. */
+  const siteKeyOf = (
+    keys: readonly string[],
+    aliasLine: number | undefined,
+  ): string | undefined => {
+    const key = preferredKey(keys);
+    // Monkey-patch wrapper: `local orig = X.f` captured the value X.f held
+    // BEFORE this file (re)defined it, so the alias never names this file's
+    // later definition — resolving it there would mint a self-call.
+    if (key === undefined || aliasLine === undefined) return key;
+    return (definedAt.get(key) ?? []).some((line) => line >= aliasLine) ? undefined : key;
+  };
+
   const callKeys = new Map<string, string>();
   for (const [callKey, fact] of calls) {
     const keys =
@@ -639,16 +729,27 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
         : fact.decl === undefined
           ? [fact.name]
           : symKeys({ kind: 'local', decl: fact.decl, fields: [] });
-    const key = preferredKey(keys);
-    if (key === undefined) continue;
-    // Monkey-patch wrapper: `local orig = X.f` captured the value X.f held
-    // BEFORE this file (re)defined it, so the alias never names this file's
-    // later definition — resolving it there would mint a self-call.
-    const aliasLine = fact.kind === 'bare' ? fact.decl?.line : undefined;
-    if (aliasLine !== undefined && (definedAt.get(key) ?? []).some((line) => line >= aliasLine)) {
-      continue;
-    }
-    callKeys.set(callKey, key);
+    const key = siteKeyOf(keys, fact.kind === 'bare' ? fact.decl?.line : undefined);
+    if (key !== undefined) callKeys.set(callKey, key);
+  }
+
+  const callbackKeys: LuaCallbackKey[] = [];
+  for (const { anchor, arg, aliasLine } of callbacks) {
+    const key = siteKeyOf(symKeys(arg), aliasLine);
+    if (key !== undefined) callbackKeys.push({ ...position(anchor), key });
+  }
+
+  // `T.f = U.g`, `T.f = localFn`, `G = U.g`: the assigned path names whatever
+  // the value names. A table value is aliased through `tableKeys` instead, and
+  // a `~m.f` target writes another module's table, which this file cannot key.
+  const aliasKeys: LuaAliasKeys[] = [];
+  for (const { target, value, alias } of registrations) {
+    if (!alias) continue;
+    const resolved = resolve(value);
+    if (resolved === null || (resolved.kind === 'table' && resolved.fields.length === 0)) continue;
+    const to = keysOf(resolved);
+    const keys = symKeys(target).filter((key) => !key.startsWith('~') && !to.includes(key));
+    if (keys.length > 0 && to.length > 0) aliasKeys.push({ keys, to });
   }
 
   const returnResolved = returnSym === undefined ? null : resolve(returnSym);
@@ -670,6 +771,8 @@ export function collectLuaPathFacts(root: SyntaxNode): LuaPathFacts {
     factoryClasses,
     selfTypes,
     callKeys,
+    aliasKeys,
+    callbackKeys,
     returnKeys: returnResolved === null ? [] : keysOf(returnResolved),
     returnFields,
   };
@@ -687,6 +790,37 @@ function identityOf(resolved: Resolved): string {
     case 'def':
       return `d:${resolved.line}:${resolved.col}`;
   }
+}
+
+/** Root and fields of a path value (`A.B`, `local.x`, `#3.f`, `~m.f`); undefined otherwise. */
+function pathParts(
+  sym: Sym,
+): { readonly root: unknown; readonly fields: readonly string[] } | undefined {
+  switch (sym.kind) {
+    case 'global':
+      return { root: `g:${sym.name}`, fields: sym.fields };
+    case 'require':
+      return { root: `r:${sym.local}`, fields: sym.fields };
+    case 'local':
+      return { root: sym.decl, fields: sym.fields };
+    case 'table':
+      return { root: sym.id, fields: sym.fields };
+    default:
+      return undefined;
+  }
+}
+
+/** `guard and value` where `value` reads a path strictly below `guard` (`A and A.B`). */
+function isGuardedRead(guard: Sym, value: Sym): boolean {
+  const outer = pathParts(guard);
+  const inner = pathParts(value);
+  return (
+    outer !== undefined &&
+    inner !== undefined &&
+    outer.root === inner.root &&
+    inner.fields.length > outer.fields.length &&
+    outer.fields.every((field, index) => inner.fields[index] === field)
+  );
 }
 
 /**
